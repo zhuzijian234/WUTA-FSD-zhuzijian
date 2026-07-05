@@ -24,6 +24,7 @@ namespace path_generator
 class PathGeneratorNode : public rclcpp::Node
 {
 public:
+  // 路径生成节点构造函数，负责初始化订阅、发布和参数。
   explicit PathGeneratorNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
 private:
@@ -33,6 +34,7 @@ private:
   void onPose(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
 
   // Mode-specific path generators
+  // 生成 skidpad 和 acceleration 两种特殊路径。
   autoware_msgs::msg::Lane generateSkidpadPath() const;
   autoware_msgs::msg::Lane generateAccelerationPath() const;
 

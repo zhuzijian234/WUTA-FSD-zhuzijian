@@ -10,6 +10,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(wuta_msgs REQUIRED)
 
+# 定位管理器是 EKF/NDT 输出的统一适配层，负责给上层提供稳定的 /localization/pose。
 add_executable(localization_manager_node
   src/localization_manager.cpp
 )

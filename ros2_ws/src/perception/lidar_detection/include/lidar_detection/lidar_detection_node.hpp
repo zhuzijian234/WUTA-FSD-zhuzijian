@@ -10,6 +10,13 @@
 namespace lidar_detection
 {
 
+/**
+ * LiDAR 锥桶检测节点。
+ *
+ * 该节点是整个感知链路的入口之一：订阅点云数据，调用当前选定
+ * 的检测器后端（传统 PCL 或深度学习）得到锥桶检测结果，并将结果
+ * 发布给建图和融合模块。
+ */
 class LidarDetectionNode : public rclcpp::Node
 {
 public:

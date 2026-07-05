@@ -12,6 +12,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(wuta_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+# 构建锥桶地图节点，负责把点云检测结果与定位位姿融合成全局 ConeMap。
 add_executable(cone_map_builder_node
   src/cone_map_builder.cpp
 )

@@ -10,6 +10,8 @@ namespace ndt_localization
 NdtLocalization::NdtLocalization(const rclcpp::NodeOptions & options)
 : Node("ndt_localization", options)
 {
+  // 构造函数中完成参数读取、NDT 匹配器配置、订阅者/发布者初始化。
+  // 这一步让节点在启动后就具备完整的输入输出接口。
   map_path_           = declare_parameter("map_path",           map_path_);
   ndt_resolution_     = declare_parameter("ndt_resolution",     ndt_resolution_);
   step_size_          = declare_parameter("step_size",          step_size_);
@@ -17,7 +19,7 @@ NdtLocalization::NdtLocalization(const rclcpp::NodeOptions & options)
   max_iterations_     = declare_parameter("max_iterations",     max_iterations_);
   scan_voxel_size_    = declare_parameter("scan_voxel_size",    scan_voxel_size_);
 
-  // Configure NDT
+  // 配置 NDT 匹配器的关键参数，包括分辨率、步长、迭代次数等。
   ndt_.setResolution(ndt_resolution_);
   ndt_.setStepSize(step_size_);
   ndt_.setTransformationEpsilon(transform_epsilon_);
@@ -25,7 +27,7 @@ NdtLocalization::NdtLocalization(const rclcpp::NodeOptions & options)
 
   map_cloud_ = std::make_shared<PointCloud>();
 
-  // Subscribers
+  // 订阅点云、初始位姿和任务状态。
   cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
     "/hesai/pandar", rclcpp::SensorDataQoS(),
     std::bind(&NdtLocalization::onPointCloud, this, std::placeholders::_1));
@@ -38,7 +40,7 @@ NdtLocalization::NdtLocalization(const rclcpp::NodeOptions & options)
     "/system/mission_state", 10,
     std::bind(&NdtLocalization::onMissionState, this, std::placeholders::_1));
 
-  // Publishers
+  // 发布 NDT 估计的位姿、轨迹和对齐点云。
   pose_pub_         = create_publisher<geometry_msgs::msg::PoseStamped>("/ndt/pose", 10);
   path_pub_         = create_publisher<nav_msgs::msg::Path>("/ndt/path", 10);
   aligned_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/ndt/aligned_cloud", 10);
@@ -51,6 +53,8 @@ NdtLocalization::NdtLocalization(const rclcpp::NodeOptions & options)
 
 void NdtLocalization::onMissionState(const wuta_msgs::msg::MissionState::SharedPtr msg)
 {
+  // 任务状态切换是 NDT 激活/关闭的总开关。
+  // 只有当 mission_state 的 localization_mode 为 LOC_NDT 时，才会加载地图并开始匹配。
   using State = wuta_msgs::msg::MissionState;
   const bool should_be_active = (msg->localization_mode == State::LOC_NDT);
 
@@ -66,6 +70,8 @@ void NdtLocalization::onMissionState(const wuta_msgs::msg::MissionState::SharedP
 
 void NdtLocalization::loadMap()
 {
+  // 从磁盘加载先前由 map_saver 保存好的预先地图。
+  // 地图加载成功后，NDT 的 target 点云就已经准备好，可以对后续帧做配准。
   if (pcl::io::loadPCDFile<pcl::PointXYZ>(map_path_, *map_cloud_) == -1) {
     RCLCPP_ERROR(get_logger(), "Failed to load map: %s", map_path_.c_str());
     return;
@@ -81,6 +87,8 @@ void NdtLocalization::loadMap()
 void NdtLocalization::onInitialPose(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
 {
+  // 初始位姿是 NDT 的“起点”，用于告诉匹配器当前车辆大概在地图中的哪里。
+  // 如果这个初值不准，后续匹配容易陷入错误解。
   const auto & p = msg->pose.pose.position;
   const auto & q = msg->pose.pose.orientation;
 
@@ -104,12 +112,20 @@ void NdtLocalization::onInitialPose(
 
 void NdtLocalization::onPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
+  // 只有在 NDT 处于激活状态、地图已加载且初始位姿可用时才继续配准。
+  // 这可以避免在系统未准备好时产生无意义计算。
+  // 只有在 NDT 已激活、地图已加载且初始位姿已设置时才执行配准。
   if (!active_ || !map_loaded_ || !initial_pose_set_) return;
   runNDT(msg);
 }
 
 void NdtLocalization::runNDT(const sensor_msgs::msg::PointCloud2::SharedPtr scan_msg)
 {
+  // NDT 配准的主流程：
+  // 1) 把 ROS 点云转成 PCL 点云；
+  // 2) 降采样加速；
+  // 3) 调用 NDT 进行匹配；
+  // 4) 若收敛则更新当前位姿并发布。
   // 1. Convert to PCL
   PointCloud::Ptr scan(new PointCloud);
   pcl::fromROSMsg(*scan_msg, *scan);

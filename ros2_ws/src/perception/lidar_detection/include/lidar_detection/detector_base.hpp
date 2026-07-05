@@ -10,8 +10,8 @@ namespace lidar_detection
 using PointCloud = pcl::PointCloud<pcl::PointXYZ>;
 
 /**
- * Abstract detector interface.
- * Swap backends (traditional PCL vs DL) by implementing this interface.
+ * 检测器抽象接口。
+ * 通过实现该接口可以切换不同的检测后端（传统 PCL 或深度学习）。
  */
 class IDetector
 {

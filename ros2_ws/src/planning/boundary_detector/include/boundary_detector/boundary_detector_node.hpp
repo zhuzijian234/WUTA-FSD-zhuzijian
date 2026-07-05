@@ -46,8 +46,8 @@ private:
   uint8_t mission_mode_{wuta_msgs::msg::MissionState::MISSION_TRACKDRIVE};
 
   // Parameters
-  double lookahead_distance_{15.0};  // m — how far ahead to plan
-  double desired_velocity_{7.0};     // m/s — default, overridden by path_generator
+  double lookahead_distance_{15.0};  // m —— 路径规划前向搜索的距离
+  double desired_velocity_{7.0};     // m/s —— 默认速度，随后会被 path_generator 覆盖
 
   // Subscribers
   rclcpp::Subscription<wuta_msgs::msg::ConeMap>::SharedPtr cone_map_sub_;

@@ -8,18 +8,20 @@ using State = wuta_msgs::msg::MissionState;
 MissionManager::MissionManager(const rclcpp::NodeOptions & options)
 : Node("mission_manager", options)
 {
-  // Default mission mode from parameter
+  // 从参数服务器读取比赛任务模式，默认是 trackdrive。
   const std::string mode_str = declare_parameter<std::string>("mission_mode", "trackdrive");
   if (mode_str == "skidpad")       mission_mode_ = State::MISSION_SKIDPAD;
   else if (mode_str == "acceleration") mission_mode_ = State::MISSION_ACCELERATION;
   else                             mission_mode_ = State::MISSION_TRACKDRIVE;
 
-  // Publishers
+  // 发布者：把当前系统状态持续广播给所有模块。
+  // 任务管理器是整个系统的状态总线，所有模块都通过它获取当前任务阶段与模式。
   state_pub_ = create_publisher<State>("/system/mission_state", 10);
   inspection_result_pub_ = create_publisher<std_msgs::msg::String>(
     "/system/inspection_result", 10);  // 预留，车检结果输出
 
-  // Subscribers — normal mission
+  // 订阅者：这些输入决定当前系统是否进入建图、竞速、应急停机等阶段。
+  // 这些输入决定当前系统是否进入建图、竞速、应急停机等阶段。
   cone_map_sub_ = create_subscription<wuta_msgs::msg::ConeMap>(
     "/mapping/cone_map", 10,
     std::bind(&MissionManager::onConeMap, this, std::placeholders::_1));
@@ -58,7 +60,7 @@ MissionManager::MissionManager(const rclcpp::NodeOptions & options)
     "/system/inspection_trigger", 10,
     std::bind(&MissionManager::onInspectionTrigger, this, std::placeholders::_1));
 
-  // Periodic state broadcast at 10 Hz
+  // 周期性广播任务状态，频率 10Hz，确保所有模块都能及时知道当前阶段。
   state_timer_ = create_wall_timer(
     std::chrono::milliseconds(100),
     std::bind(&MissionManager::publishState, this));
@@ -69,6 +71,7 @@ MissionManager::MissionManager(const rclcpp::NodeOptions & options)
 
 void MissionManager::transitionTo(uint8_t new_state)
 {
+  // 状态迁移函数：负责变化系统状态，并同步设置定位模式。
   const auto state_name = [](uint8_t s) -> std::string {
     switch (s) {
       case State::IDLE:         return "IDLE";
@@ -88,6 +91,7 @@ void MissionManager::transitionTo(uint8_t new_state)
 
   current_state_ = new_state;
 
+  // 进入 RACE 时，切换到 NDT 定位；进入 EXPLORE 时，切换到 KISS-ICP + EKF 定位。
   if (new_state == State::RACE) {
     localization_mode_ = State::LOC_NDT;
     RCLCPP_INFO(get_logger(), "Localization: NDT map matching");
@@ -116,7 +120,7 @@ void MissionManager::onConeMap(const wuta_msgs::msg::ConeMap::SharedPtr msg)
     RCLCPP_INFO(get_logger(), "Cone map closed. %zu blue + %zu yellow cones.",
       msg->blue_cones.size(), msg->yellow_cones.size());
     transitionTo(State::MAPPING_DONE);
-    // TODO: wait for NDT map build completion, then transitionTo(State::RACE)
+    // TODO: 等待 NDT 地图生成完成后，再切换到 RACE 状态
   }
 }
 
@@ -173,7 +177,7 @@ void MissionManager::runInspection()
   // TODO: 检查 TF tree 是否完整
   // TODO: 发布检查结果到 /system/inspection_result
 
-  RCLCPP_INFO(get_logger(), "[INSPECTION] Sensor check — not yet implemented.");
+  RCLCPP_INFO(get_logger(), "[INSPECTION] 传感器检查 — 尚未实现。");
 
   std_msgs::msg::String result;
   result.data = "INSPECTION_NOT_IMPLEMENTED";
@@ -186,7 +190,7 @@ void MissionManager::sendInspectionCAN()
   // 建议通过 can_msgs::msg::Frame 发布到 /can/tx topic
   // 具体报文格式需根据 VCU 协议文档确定
 
-  RCLCPP_INFO(get_logger(), "[INSPECTION] VCU CAN test — not yet implemented.");
+  RCLCPP_INFO(get_logger(), "[INSPECTION] VCU CAN 测试 — 尚未实现。");
 }
 
 }  // namespace mission_manager

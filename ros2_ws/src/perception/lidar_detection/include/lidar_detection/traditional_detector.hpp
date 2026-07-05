@@ -7,28 +7,35 @@ namespace lidar_detection
 
 struct TraditionalDetectorConfig
 {
-  // Ground removal
-  double ground_z_threshold{-0.8};     // Points below this height (m) relative to sensor are ground
-  double ransac_distance_threshold{0.2}; // RANSAC inlier distance (m)
-  bool use_ransac{true};               // true=RANSAC, false=simple height threshold
+  // 地面去除
+  double ground_z_threshold{-0.8};     // 相对传感器高度低于该值的点被视为地面
+  double ransac_distance_threshold{0.2}; // RANSAC 采样内点距离阈值（m）
+  bool use_ransac{true};               // true=使用 RANSAC，false=使用简单高度阈值
 
-  // Voxel downsampling before clustering
+  // 聚类前体素下采样
   double voxel_leaf_size{0.1};         // m
 
-  // Euclidean clustering
-  double cluster_tolerance{0.4};       // m — max distance between points in same cluster
+  // 欧式聚类
+  double cluster_tolerance{0.4};       // m —— 同一簇内点的最大距离
   int min_cluster_size{3};
   int max_cluster_size{200};
 
-  // Cone shape filter (bounding box of cluster)
+  // 锥桶形状筛选（基于聚类包围盒）
   double max_cone_width{0.5};          // m
   double max_cone_height{0.6};         // m
   double min_cone_height{0.1};         // m
 
-  // Detection range
-  double max_detection_range{20.0};    // m from sensor origin
+  // 检测范围
+  double max_detection_range{20.0};    // m —— 相对传感器原点的最大检测距离
 };
 
+/**
+ * 传统 PCL 版本的锥桶检测器。
+ *
+ * 通过范围滤波、地面去除、体素下采样、欧氏聚类和尺寸筛选
+ * 的流程，从原始点云中提取候选锥桶。它不依赖深度学习模型，
+ * 适合做基线检测与调试。
+ */
 class TraditionalDetector : public IDetector
 {
 public:

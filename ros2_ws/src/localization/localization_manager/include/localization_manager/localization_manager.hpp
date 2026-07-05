@@ -11,16 +11,16 @@ namespace localization_manager
 {
 
 /**
- * Localization Manager
+ * 定位管理器。
  *
- * Subscribes to two localization sources:
- *   - EXPLORE mode: EKF output (KISS-ICP + CG-410 fusion)
- *   - RACE mode:    NDT map matching output
+ * 该节点负责接收两种定位源的输出：
+ *   - EXPLORE 模式：EKF 输出（KISS-ICP + CG-410 融合）
+ *   - RACE 模式：NDT 地图匹配输出
  *
- * Publishes a single unified topic: /localization/pose
- * Downstream nodes (planning, control) only subscribe to /localization/pose.
+ * 最终统一发布到 /localization/pose 主题，
+ * 规划与控制模块只需要订阅这一条统一接口。
  *
- * Mode switching is driven by /system/mission_state from MissionManager.
+ * 模式切换由 MissionManager 通过 /system/mission_state 驱动。
  */
 class LocalizationManager : public rclcpp::Node
 {

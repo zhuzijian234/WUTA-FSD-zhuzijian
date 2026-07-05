@@ -20,7 +20,7 @@ struct TrackedCone
 {
   double x, y, z;
   uint8_t color;
-  int hit_count{1};       // Number of times detected (confidence proxy)
+  int hit_count{1};       // 检测命中次数，用作置信度代理值
 };
 
 class ConeMapBuilder : public rclcpp::Node

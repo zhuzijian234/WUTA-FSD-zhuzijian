@@ -16,7 +16,7 @@ PathGeneratorNode::PathGeneratorNode(const rclcpp::NodeOptions & options)
   acceleration_length_    = declare_parameter("acceleration_length",    acceleration_length_);
   acceleration_velocity_  = declare_parameter("acceleration_velocity",  acceleration_velocity_);
 
-  // Subscribers
+  // 订阅任务状态，决定当前要生成哪种路径。
   mission_sub_ = create_subscription<State>(
     "/system/mission_state", 10,
     std::bind(&PathGeneratorNode::onMissionState, this, std::placeholders::_1));
@@ -29,7 +29,8 @@ PathGeneratorNode::PathGeneratorNode(const rclcpp::NodeOptions & options)
     "/localization/pose", 10,
     std::bind(&PathGeneratorNode::onPose, this, std::placeholders::_1));
 
-  // Publisher — final_waypoints consumed by controller
+  // 发布最终路径点，供控制器进行纯跟踪。
+  // 生成后的路径点会被控制器作为纯跟踪参考使用。
   waypoints_pub_ = create_publisher<autoware_msgs::msg::Lane>("/planning/final_waypoints", 10);
 
   RCLCPP_INFO(get_logger(), "PathGeneratorNode ready.");
@@ -43,13 +44,15 @@ void PathGeneratorNode::onPose(const geometry_msgs::msg::PoseStamped::SharedPtr 
 
 void PathGeneratorNode::onMissionState(const State::SharedPtr msg)
 {
+  // 根据任务状态机更新当前模式和系统状态。
   mission_mode_  = msg->mission_mode;
   system_state_  = msg->state;
 
-  // Trigger non-trackdrive paths when system is active
+  // 当系统进入可运行状态时，触发非 trackdrive 的特殊路径生成。
   if (system_state_ != State::EXPLORE && system_state_ != State::RACE) return;
   if (!pose_ready_) return;
 
+  // skidpad 模式生成漂移路径，acceleration 模式生成直线加速路径。
   if (mission_mode_ == State::MISSION_SKIDPAD) {
     auto lane = generateSkidpadPath();
     lane.header.stamp    = now();
@@ -66,7 +69,7 @@ void PathGeneratorNode::onMissionState(const State::SharedPtr msg)
 
 void PathGeneratorNode::onCenterline(const autoware_msgs::msg::Lane::SharedPtr msg)
 {
-  // Only forward trackdrive centerline
+  // 仅在 trackdrive 模式下，把边界检测器生成的 centerline 转发给控制器。
   if (mission_mode_ != State::MISSION_TRACKDRIVE) return;
   if (system_state_ != State::EXPLORE && system_state_ != State::RACE) return;
 
@@ -141,7 +144,7 @@ autoware_msgs::msg::Lane PathGeneratorNode::generateAccelerationPath() const
   const double cy  = current_pose_.pose.position.y;
   const double z   = current_pose_.pose.position.z;
 
-  // Vehicle heading direction
+  // 车辆当前航向方向
   const auto & q = current_pose_.pose.orientation;
   const double yaw = std::atan2(
     2.0 * (q.w * q.z + q.x * q.y),

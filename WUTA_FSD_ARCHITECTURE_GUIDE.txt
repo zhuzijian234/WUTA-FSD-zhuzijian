@@ -1,0 +1,646 @@
+WUTA-FSD 工程架构说明（ROS2 版）
+=================================
+
+1. 项目定位
+-----------
+WUTA-FSD 是武汉理工大学无人驾驶方程式赛车自动驾驶算法栈。它以 ROS2 为基础，按“感知 -> 定位 -> 建图 -> 规划 -> 控制 -> 系统管理”的层级结构组织。
+当前实现重点覆盖：
+- LiDAR 锥桶检测
+- 定位管理（EKF/NDT 双模式切换）
+- 锥桶地图构建
+- 赛道边界中心线生成
+- 路径生成（trackdrive / skidpad / acceleration）
+- Pure Pursuit 控制
+- 任务状态机与系统管理
+
+工程整体目标：
+- 从传感器输入中识别赛道锥桶；
+- 根据当前任务模式生成参考轨迹；
+- 使用定位结果进行控制决策；
+- 通过统一的 mission state 驱动整个系统的状态切换。
+
+2. 工程目录结构
+----------------
+WUTA-FSD/
+├── README.md
+├── REFACTOR.md
+└── ros2_ws/
+    └── src/
+        ├── common/
+        │   ├── wuta_msgs/
+        │   └── wuta_tools/
+        ├── control/
+        │   └── controller/
+        ├── localization/
+        │   ├── kiss_icp_wrapper/
+        │   ├── kiss-icp/ (submodule)
+        │   ├── localization_manager/
+        │   ├── ndt_localization/
+        │   └── robot_localization/ (submodule)
+        ├── mapping/
+        │   └── cone_map_builder/
+        ├── perception/
+        │   ├── camera_detection/
+        │   ├── detection_fusion/
+        │   └── lidar_detection/
+        ├── planning/
+        │   ├── boundary_detector/
+        │   └── path_generator/
+        └── system/
+            └── mission_manager/
+
+3. 代码组织逻辑：分层职责
+-------------------------
+3.1 感知层（perception）
+- lidar_detection：订阅点云，输出锥桶检测结果。
+- camera_detection：预留相机检测接口。
+- detection_fusion：预留多源融合接口。
+
+3.2 定位层（localization）
+- localization_manager：统一接收 EKF 与 NDT 的定位结果，并对外发布统一的 /localization/pose。
+- ndt_localization：基于 PCL/NDT 的地图匹配定位。
+- map_saver：累积点云并保存地图。
+- kiss_icp_wrapper：为 KISS-ICP 提供参数配置与接入接口。
+
+3.3 建图层（mapping）
+- cone_map_builder：把检测到的锥桶和当前位姿融合，生成 ConeMap，并进行 loop closure 判断。
+
+3.4 规划层（planning）
+- boundary_detector：从 ConeMap 中提取赛道边界中心线。
+- path_generator：将中心线或预定义赛道模式转换为控制器可消费的 waypoints。
+
+3.5 控制层（control）
+- controller：接收定位、速度、路径和任务状态，计算 Pure Pursuit 的控制输出。
+
+3.6 系统管理层（system）
+- mission_manager：整个系统的状态机和总控中心。
+
+4. 自定义消息定义（common/wuta_msgs）
+--------------------------------------
+消息包的作用：
+- 为整个系统提供统一的数据类型，避免各节点之间使用不同结构。
+- 所有节点都依赖 wuta_msgs 包。
+- 其 package.xml 说明它是 ROS2 的接口包，使用 rosidl_default_generators 生成消息代码。
+
+4.1 消息包的职责分层
+- package.xml 中声明了 std_msgs 和 geometry_msgs 依赖，说明 wuta_msgs 依赖基础几何与头文件消息。
+- CMakeLists.txt 中通过 rosidl_generate_interfaces 生成 C++/Python 代码，其他包再通过 find_package(wuta_msgs) 直接使用。
+- 因为它是整个系统的接口层，所以它必须优先于其他业务包被编译。
+
+4.2 各消息文件的意义
+- msg/Cone.msg：单个锥桶对象，包含位置、颜色、置信度。
+- msg/ConeArray.msg：一帧锥桶检测结果，常用于 LiDAR 或相机节点输出。
+- msg/ConeMap.msg：全局锥桶地图，色彩分组且带闭环标志。
+- msg/MissionState.msg：任务与系统状态，作为总控状态总线。
+
+4.3 数据流与消息角色
+- LiDAR 检测节点输出 ConeArray；
+- cone_map_builder 将 ConeArray 融合成 ConeMap；
+- mission_manager 通过 MissionState 控制全局状态；
+- controller 和 planner 依赖 MissionState 决定是否进行控制或生成路径。
+
+主要消息文件：
+- msg/Cone.msg
+  - 表示单个锥桶对象。
+  - 字段包括位置、颜色和置信度。
+- msg/ConeArray.msg
+  - 一组锥桶的集合，通常是单帧 LiDAR 检测结果。
+- msg/ConeMap.msg
+  - 由多帧锥桶融合后的地图结果。
+  - 包含 blue_cones、yellow_cones、orange_cones、unknown_cones 与 is_closed 标志。
+- msg/MissionState.msg
+  - 系统状态与任务模式。
+  - 包括 state、mission_mode、localization_mode、description。
+
+CMake 关系：
+- 通过 rosidl_generate_interfaces 生成 ROS2 消息接口。
+- 其他包依赖 wuta_msgs 后即可直接使用这些消息类型。
+
+5. 各包的 CMake 构建关系
+------------------------
+5.1 common/wuta_msgs/CMakeLists.txt
+- 生成 ROS2 消息接口。
+- 依赖 std_msgs 和 geometry_msgs。
+- 作为整个系统的消息基础层。
+
+5.2 perception/lidar_detection/CMakeLists.txt
+- 编译可执行文件 lidar_detection_node。
+- 源文件包括：
+  - src/lidar_detection_node.cpp
+  - src/traditional_detector.cpp
+  - src/dl_detector.cpp
+- 依赖：
+  - rclcpp
+  - sensor_msgs
+  - visualization_msgs
+  - wuta_msgs
+  - PCL
+  - pcl_conversions
+- 说明：
+  - 该包把检测逻辑拆成节点主控制与两个后端检测器。
+  - traditional_detector 使用传统 PCL 流水线。
+  - dl_detector 预留深度学习检测接口。
+
+5.3 localization/localization_manager/CMakeLists.txt
+- 编译可执行文件 localization_manager_node。
+- 依赖：rclcpp、nav_msgs、geometry_msgs、std_msgs、wuta_msgs。
+- 作用：统一 EKF/NDT 的输出，为后续规划和控制提供稳定接口。
+
+5.4 localization/ndt_localization/CMakeLists.txt
+- 编译两个节点：
+  - ndt_localization_node
+  - map_saver_node
+- 依赖：PCL、Eigen3、pcl_conversions、ROS2 消息类型。
+- 说明：
+  - ndt_localization_node 负责地图匹配定位。
+  - map_saver_node 负责累积点云并保存地图。
+
+5.5 mapping/cone_map_builder/CMakeLists.txt
+- 编译可执行文件 cone_map_builder_node。
+- 依赖：rclcpp、geometry_msgs、visualization_msgs、tf2_ros、tf2_geometry_msgs、wuta_msgs、yaml-cpp。
+- 说明：
+  - 需要 TF2 变换来把传感器坐标系下的锥桶转为地图坐标系。
+  - 使用 yaml-cpp 保存地图结果。
+
+5.6 planning/boundary_detector/CMakeLists.txt
+- 编译可执行文件 boundary_detector_node。
+- 额外构建一个静态库 pathplanning。
+- pathplanning 库来源于 thirdparty/pathplanning/src/*.cpp。
+- 说明：
+  - pathplanning 是纯 C++ 的算法库，负责 Delaunay 三角剖分和路径搜索。
+  - boundary_detector_node 通过链接该库来生成中心线。
+
+5.7 planning/path_generator/CMakeLists.txt
+- 编译可执行文件 path_generator_node。
+- 依赖 autoware_msgs 与 wuta_msgs。
+- 说明：
+  - 生成三种路径：trackdrive、skidpad、acceleration。
+
+5.8 control/controller/CMakeLists.txt
+- 编译可执行文件 controller_node。
+- 同时编译：
+  - src/controller_node.cpp
+  - src/pure_pursuit.cpp
+  - src/twist_filter.cpp
+- 依赖：rclcpp、geometry_msgs、visualization_msgs、autoware_msgs、wuta_msgs。
+- 说明：
+  - 纯跟踪控制器的主程序与两个辅助逻辑文件被一同编译。
+  - 其中 pure_pursuit.cpp 实现了横向跟踪控制，twist_filter.cpp 负责速度与转角的安全限幅。
+
+8. 规划与控制的关键链路
+------------------------
+- planning 层把赛道边界转成参考路径；
+- path_generator 根据 mission_mode 生成 trackdrive / skidpad / acceleration 对应路径；
+- controller 节点在收到 /localization/pose、/planning/final_waypoints 和 /system/mission_state 后，使用 Pure Pursuit 计算转向角；
+- twist_filter 再对速度和转角做平滑与限制，最终发布 /control/command。
+
+这条链路是系统的“执行链”，决定车辆是否能够稳定跟踪预设轨迹。
+
+9. 启动顺序与运行流程
+----------------------
+9.1 最小可运行顺序
+- 先编译整个工作区：colcon build --symlink-install
+- 然后 source install/setup.bash
+- 启动定位链路：ros2 launch localization_manager localization.launch.py
+  - 该 launch 会拉起 kiss_icp_node、ekf_node 和 localization_manager_node
+  - 它们共同提供 /localization/pose 和 /system/localization_ready
+- 启动感知链路：ros2 run lidar_detection lidar_detection_node
+- 启动 mission_manager：ros2 run mission_manager mission_manager_node
+- 启动建图/规划/控制链路：
+  - ros2 run cone_map_builder cone_map_builder_node
+  - ros2 run boundary_detector boundary_detector_node
+  - ros2 run path_generator path_generator_node
+  - ros2 run controller controller_node
+
+9.2 任务状态切换说明
+- 初始状态通常由 mission_manager 维持为 IDLE/READY
+- 当系统准备完成并收到地图闭合信号后，mission_manager 会切换为 MAPPING_DONE
+- 之后如果进入竞速阶段，mission_manager 会切换为 RACE，并让 localization_mode 变成 LOC_NDT
+- 这时 localization_manager 会从 /ndt/pose 切换为统一输出 /localization/pose
+
+9.3 依赖关系总结
+- wuta_msgs 是所有节点共享的数据接口基础层
+- lidar_detection 负责把原始点云转成 ConeArray
+- cone_map_builder 负责把 ConeArray 与位姿融合成 ConeMap
+- boundary_detector + path_generator 负责把 ConeMap 变成控制器可用的参考路径
+- controller 负责把路径和位姿变成速度/转角控制指令
+- mission_manager 负责协调状态切换，确保各模块在正确的阶段工作
+
+10. 代码阅读建议
+----------------
+如果你要从源码入手理解整个系统，建议按下面顺序阅读：
+1. 先看 wuta_msgs 中的消息定义，理解各模块之间传递的数据结构；
+2. 再看 mission_manager，理解整个系统的状态机；
+3. 再看 lidar_detection 与 cone_map_builder，理解感知与建图的链路；
+4. 然后看 boundary_detector 和 path_generator，理解路径是如何生成的；
+5. 最后看 controller、pure_pursuit 和 twist_filter，理解控制命令是如何生成的；
+6. 最后看 localization_manager 与 ndt_localization，理解定位链路如何接上主控制流程。
+
+这样读下来，能够把“数据从哪里来、经过哪些模块、最后发给谁”串成一条完整链路。
+
+11. 项目重构总结与当前成熟度
+----------------------------
+- 这是一个以 ROS2 为核心、面向 J6 域控制器的无人车方程式赛车自动驾驶栈。
+- 当前实现已经把“感知 → 定位 → 建图 → 规划 → 控制 → 状态管理”的主链路搭起来，核心节点和消息接口都已落地。
+- 其中控制层、规划层、感知层、建图层以及状态机都已经具备较清晰的代码结构，适合继续调试和实车接入。
+- 目前仍有两类尚未完全成熟：
+  1. NDT 定位与地图保存仍需要实车标定和参数调优；
+  2. 相机检测与多源融合仍是预留接口，尚未正式接入。
+- 从工程角度看，当前代码已具备“可阅读、可扩展、可继续迭代”的基本条件。
+
+12. 建议的下一步迭代顺序
+------------------------
+1. 先把 NDT 参数和 TF 外参调通，确保定位链路在实车上稳定；
+2. 再补充相机检测与 detection_fusion 的实际实现；
+3. 最后把 mission_manager 的 inspection / CAN 接口真正接到硬件或模拟层。
+
+以上内容可作为后续开发和交接的参考依据。
+5.9 system/mission_manager/CMakeLists.txt
+- 编译 mission_manager_node。
+- 依赖：rclcpp、std_msgs、wuta_msgs。
+- 说明：
+  - 作为总控节点，控制系统的状态切换。
+
+6. 库与头文件包含关系
+----------------------
+6.1 组件级依赖关系
+- 所有功能节点都依赖 wuta_msgs，作为共享消息接口。
+- 控制与规划层依赖 autoware_msgs，因为它们使用 Lane/Waypoint/Command 这类标准消息。
+- 感知与定位层依赖 PCL，因此它们使用点云处理能力。
+- 建图层依赖 TF2 和 YAML。
+- 控制层内部使用两个辅助源文件：pure_pursuit.cpp 和 twist_filter.cpp。
+
+6.2 包内头文件包含关系
+- controller_node.cpp 包含：
+  - controller/controller_node.hpp
+  - visualization_msgs/msg/marker.hpp
+- pure_pursuit.cpp 包含：
+  - controller/pure_pursuit.hpp
+- twist_filter.cpp 包含：
+  - controller/twist_filter.hpp
+- lidar_detection_node.cpp 包含：
+  - lidar_detection/lidar_detection_node.hpp
+  - lidar_detection/traditional_detector.hpp
+  - lidar_detection/dl_detector.hpp
+- traditional_detector.cpp 包含：
+  - lidar_detection/traditional_detector.hpp
+- cone_map_builder.cpp 包含：
+  - cone_map_builder/cone_map_builder.hpp
+- boundary_detector_node.cpp 包含：
+  - boundary_detector/boundary_detector_node.hpp
+- path_generator_node.cpp 包含：
+  - path_generator/path_generator_node.hpp
+- mission_manager.cpp 包含：
+  - mission_manager/mission_manager.hpp
+
+6.3 第三方库关系
+- boundary_detector 通过 pathplanning 静态库实现 Delaunay 路径搜索。
+- lidar_detection 与 ndt_localization 通过 PCL 完成过滤、分割、聚类、配准。
+- cone_map_builder 通过 yaml-cpp 保存地图。
+- ndt_localization 通过 Eigen3 完成旋转平移矩阵运算。
+
+7. 主题（Topic）关系总览
+-------------------------
+7.1 输入主题
+- /hesai/pandar
+  - 由 LiDAR 驱动或数据源发布。
+  - 被 lidar_detection 与 ndt_localization / map_saver 订阅。
+- /initialpose
+  - 由 RViz 或外部初始化定位姿态使用。
+  - 被 ndt_localization 订阅。
+- /system/mission_mode_cmd
+  - 任务模式切换命令。
+  - 被 mission_manager 订阅。
+
+7.2 中间主题
+- /perception/lidar/cones
+  - lidar_detection 输出的 ConeArray。
+  - 被 cone_map_builder 订阅。
+- /mapping/cone_map
+  - cone_map_builder 输出的 ConeMap。
+  - 被 boundary_detector 与 mission_manager 订阅。
+- /planning/centerline
+  - boundary_detector 输出的 centerline Lane。
+  - 被 path_generator 订阅。
+- /planning/final_waypoints
+  - path_generator 输出的最终路径点。
+  - 被 controller 订阅。
+
+8. 运行时数据流（从传感器到控制）
+--------------------------------
+1. LiDAR 输入：/hesai/pandar 被 lidar_detection 和 ndt_localization 同时订阅。
+2. 感知输出：lidar_detection 将检测到的锥桶发布到 /perception/lidar/cones。
+3. 建图阶段：cone_map_builder 接收检测结果和 /localization/pose，将锥桶变换到地图坐标系并融合成 /mapping/cone_map。
+4. 规划阶段：boundary_detector 从 ConeMap 生成 /planning/centerline；path_generator 再根据 mission_mode 生成 /planning/final_waypoints。
+5. 定位阶段：ndt_localization 在 RACE 模式下基于地图点云做配准，并将结果发布到 /ndt/pose；localization_manager 将其转成统一的 /localization/pose。
+6. 控制阶段：controller 订阅 /localization/pose、/planning/final_waypoints、/system/mission_state 和速度信息，计算 steering / velocity 输出。
+7. 状态管理：mission_manager 是总控节点，负责将系统状态从 IDLE、READY、EXPLORE、MAPPING_DONE、RACE、EMERGENCY 等切换。
+
+这条链路是整个系统的主线，任何一个环节出现问题都会影响后续规划与控制。
+- /localization/pose
+  - localization_manager 输出统一定位结果。
+  - 被 boundary_detector、path_generator、controller 订阅。
+- /system/mission_state
+  - mission_manager 发布系统状态与模式。
+  - 被 localization_manager、boundary_detector、path_generator、controller、ndt_localization、map_saver 订阅。
+
+7.3 控制与状态主题
+- /control/command
+  - controller 输出速度与转角命令。
+  - 供下游车辆控制层使用。
+- /system/localization_ready
+  - localization_manager 发布定位就绪状态。
+- /system/lidar_ready
+  - 由外部感知或系统上层发布，mission_manager 使用它决定是否进入 READY。
+- /system/emergency
+  - 应急停止信号。
+- /system/inspection_trigger
+  - 车检触发信号，预留接口。
+- /system/inspection_result
+  - 车检结果输出，预留接口。
+- /ndt/map_ready
+  - map_saver 保存好地图后发布。
+
+8. 关键节点逐个说明
+-------------------
+8.1 lidar_detection_node
+文件：perception/lidar_detection/src/lidar_detection_node.cpp
+功能：
+- 初始化检测器类型（traditional 或 dl）。
+- 订阅点云主题 /hesai/pandar。
+- 每收到一帧点云，调用检测器进行锥桶识别。
+- 发布 /perception/lidar/cones 与可视化 marker。
+关键逻辑：
+- 构造函数根据参数选择传统检测器或深度学习检测器。
+- onPointCloud 将点云转换成 PCL 类型，调用 detector_->detect(cloud)。
+- 生成 marker 可视化，便于 Rviz 查看。
+
+8.2 traditional_detector
+文件：perception/lidar_detection/src/traditional_detector.cpp
+功能：
+- 对点云执行范围过滤、地面去除、体素下采样、欧氏聚类、锥桶形状筛选。
+- 输出每个候选锥桶的中心点坐标。
+关键算法：
+- 使用 PassThrough 进行高度过滤。
+- 使用 RANSAC 平面拟合去除地面。
+- 使用 VoxelGrid 降采样。
+- 使用 EuclideanClusterExtraction 聚类。
+- 使用 bounding box 尺寸约束判断是否是锥桶。
+
+8.3 cone_map_builder
+文件：mapping/cone_map_builder/src/cone_map_builder.cpp
+功能：
+- 订阅 /perception/lidar/cones 和 /localization/pose。
+- 将锥桶从传感器坐标系变换到地图坐标系。
+- 对同一锥桶进行融合与去重。
+- 通过 hit_count 过滤噪声。
+- 判断 loop closure，并发布 ConeMap。
+关键逻辑：
+- onPose 记录当前位姿。
+- onCones 将新检测的锥桶整合入 cone_map_。
+- integrateDetections 使用 TF2 变换坐标。
+- assignColor 根据车头朝向给锥桶分类为蓝/黄/橙/未知。
+- checkLoopClosure 通过起点回到附近判断地图闭合。
+- saveMapToYaml 将地图保存为 YAML 文件。
+
+8.4 localization_manager
+文件：localization/localization_manager/src/localization_manager.cpp
+功能：
+- 订阅 /system/mission_state、/odometry/filtered、/ndt/pose。
+- 根据当前 localization_mode 决定使用 EKF 还是 NDT 输出。
+- 输出统一的 /localization/pose 与 /system/localization_ready。
+关键逻辑：
+- 如果 mission state 指示 LOC_KISS_ICP，则使用 EKF 输出。
+- 如果 mission state 指示 LOC_NDT，则使用 NDT 输出。
+- 这让后续模块无需关心底层定位来源。
+
+8.5 ndt_localization
+文件：localization/ndt_localization/src/ndt_localization.cpp
+功能：
+- 在 RACE 阶段根据地图匹配输出位姿。
+- 订阅 /hesai/pandar 点云和 /initialpose 初始位姿。
+- 发布 /ndt/pose、/ndt/path、/ndt/aligned_cloud。
+关键逻辑：
+- onMissionState 根据 MissionState 的 localization_mode 激活/关闭 NDT。
+- loadMap 加载 PCD 地图。
+- onInitialPose 设置初始变换。
+- runNDT 对当前点云进行下采样与 NDT 配准。
+- publishPose 将最终变换转为 PoseStamped 并发布路径。
+
+8.6 map_saver
+文件：localization/ndt_localization/src/map_saver.cpp
+功能：
+- 订阅点云与 odometry。
+- 在 MAPPING_DONE 阶段开始积累地图。
+- 保存地图为 PCD 文件。
+- 发布 /ndt/map_ready。
+关键逻辑：
+- 仅在地图尚未保存时积累点云。
+- 利用里程计位置判断是否需要累加新的扫描。
+- 通过 voxel downsampling 控制地图规模。
+- 保存后发布就绪信号。
+
+8.7 boundary_detector
+文件：planning/boundary_detector/src/boundary_detector_node.cpp
+功能：
+- 订阅 /mapping/cone_map、/localization/pose、/system/mission_state。
+- 根据当前 pose 和 cone_map 生成 centerline。
+- 发布 /planning/centerline 和可视化 marker。
+关键逻辑：
+- onConeMap 在满足条件时把 cone_map 转换成点集。
+- coneMapToPoints 从 ConeMap 中提取落在当前 lookahead 范围内的锥桶点。
+- computeCenterline 调用第三方 pathplanning 库完成 Delaunay 搜索与最优路径选择。
+- 只有 trackdrive 模式会触发该节点的中心线生成。
+
+8.8 path_generator
+文件：planning/path_generator/src/path_generator_node.cpp
+功能：
+- 订阅 /system/mission_state、/planning/centerline、/localization/pose。
+- 根据 mission_mode 生成不同的路径：
+  - trackdrive：转发 centerline
+  - skidpad：生成双圈漂移路径
+  - acceleration：生成直线加速路径
+- 发布 /planning/final_waypoints。
+关键逻辑：
+- onMissionState 根据当前状态和模式触发路径生成。
+- generateSkidpadPath 通过车头姿态和半径生成圆弧轨迹。
+- generateAccelerationPath 生成沿当前车头方向的直线加速路径。
+
+8.9 controller
+文件：control/controller/src/controller_node.cpp
+功能：
+- 订阅 /localization/pose、/localization/velocity、/planning/final_waypoints、/system/mission_state。
+- 在控制周期中根据当前车况和路径点计算控制命令。
+- 发布 /control/command 与目标点可视化。
+关键逻辑：
+- onPose 更新车辆位置与航向。
+- onVelocity 更新当前速度。
+- onWaypoints 更新路径点集合。
+- onMissionState 根据任务状态决定是否启用控制。
+- controlLoop 在固定频率下执行 Pure Pursuit 和安全滤波。
+
+8.10 pure_pursuit
+文件：control/controller/src/pure_pursuit.cpp
+功能：
+- 基于路径点与当前车辆位姿计算目标点和曲率。
+- 输出 steering angle 和目标速度。
+关键逻辑：
+- 根据当前速度调整 lookahead distance。
+- 从路径点中选取最近目标点。
+- 将目标点转换到车体坐标系，计算横向偏移。
+- 由曲率求得转角。
+
+8.11 twist_filter
+文件：control/controller/src/twist_filter.cpp
+功能：
+- 对控制指令做平滑与限幅处理，避免急加速或剧烈转向。
+- 处理 emergency 情况时直接输出零速度与零转角。
+
+8.12 controller 头文件结构
+文件：control/controller/include/controller/*.hpp
+说明：
+- controller_node.hpp 定义 ControllerNode 的类接口，包含订阅者、发布者、状态变量和回调函数声明。
+- pure_pursuit.hpp 定义 PurePursuit 控制算法的核心结构与配置项。
+- twist_filter.hpp 定义速度/转角的安全滤波器。
+- vehicle_state.hpp 定义车辆参数与车辆状态数据结构。
+
+8.13 lidar_detection 头文件与接口
+文件：perception/lidar_detection/include/lidar_detection/*.hpp
+说明：
+- detector_base.hpp 定义 IDetector 抽象接口，所有检测器都要继承它。
+- traditional_detector.hpp 提供传统 PCL 检测器参数与实际实现接口。
+- dl_detector.hpp 是深度学习检测器的占位接口，当前未实现。
+- lidar_detection_node.hpp 定义 LidarDetectionNode 的 ROS2 节点接口。
+
+8.14 DL 检测器占位说明
+文件：perception/lidar_detection/src/dl_detector.cpp
+说明：
+- 当前实现是“占位版本”，构造函数会直接抛出异常，说明 DL 检测未接入。
+- 其设计目的是为后续接入 Horizon BPU / TensorRT / ONNX Runtime 留出接口。
+- 这说明该工程在感知层上已经预留了升级路径，但当前主线仍以传统 PCL 检测为主。
+
+8.15 wuta_msgs 消息类型说明
+文件：common/wuta_msgs/msg/*.msg
+说明：
+- Cone.msg：单个锥桶的语义表示。
+- ConeArray.msg：一帧检测结果，通常由 lidar_detection 或相机检测发布。
+- ConeMap.msg：由 cone_map_builder 生成的全局/局部锥桶地图。
+- MissionState.msg：全局任务状态和模式切换消息，是模块间状态协同的关键。
+
+8.16 mission_manager 头文件结构
+文件：system/mission_manager/include/mission_manager/mission_manager.hpp
+说明：
+- MissionManager 类继承自 rclcpp::Node，承担状态机与总控制角色。
+- current_state_、mission_mode_ 和 localization_mode_ 分别保存当前阶段、比赛任务和定位模式。
+- transitionTo 和 publishState 是状态机的核心逻辑。
+- 订阅者包括 cone_map、emergency、mission_mode_cmd、lidar_status、localization_status 和 inspection_trigger。
+- 发布者包括 /system/mission_state 和 /system/inspection_result。
+
+8.17 localization_manager 头文件结构
+文件：localization/localization_manager/include/localization_manager/localization_manager.hpp
+说明：
+- LocalizationManager 的作用是统一底层定位接口。
+- 它订阅 EKF 和 NDT 两种定位来源，并将结果统一发布到 /localization/pose。
+- active_mode_ 用于记录当前正在使用的定位模式。
+- publishLocalizationReady 用于发布定位就绪状态。
+
+8.18 boundary_detector 头文件结构
+文件：planning/boundary_detector/include/boundary_detector/boundary_detector_node.hpp
+说明：
+- BoundaryDetectorNode 使用 Delaunay 三角剖分和 pathplanning 库生成中心线。
+- coneMapToPoints 把 ConeMap 转成二维点集；computeCenterline 执行路径搜索；publishVisualization 输出可视化。
+- current_pose_ 和 mission_mode_ 是生成路径所需状态。
+
+8.19 cone_map_builder 头文件结构
+文件：mapping/cone_map_builder/include/cone_map_builder/cone_map_builder.hpp
+说明：
+- TrackedCone 用于保存一个已被观测多次的锥桶状态，包含位置、颜色和命中次数。
+- integrateDetections 是核心融合逻辑，负责 TF2 坐标变换和地图更新。
+- publishMap、publishVisualization 和 saveMapToYaml 分别负责发布地图、可视化和 YAML 持久化。
+- 使用两个 callback group，保证位姿处理不被锥桶处理阻塞。
+
+8.20 path_generator 头文件结构
+文件：planning/path_generator/include/path_generator/path_generator_node.hpp
+说明：
+- PathGeneratorNode 根据 mission_state 和 mission_mode 切换生成不同路径。
+- onMissionState 负责分发 trackdrive、skidpad 和 acceleration 三种路径逻辑。
+- generateSkidpadPath 用于创建漂移/figure-8 轨迹；generateAccelerationPath 用于生成直线加速轨迹。
+- 所有输出都发布到 /planning/final_waypoints，供控制器直接使用。
+
+8.21 消息定义说明补充
+文件：common/wuta_msgs/msg/*.msg
+说明：
+- Cone.msg 表示单个锥桶；
+- ConeArray.msg 表示一帧检测结果；
+- ConeMap.msg 表示全局锥桶地图；
+- MissionState.msg 表示当前任务状态和模式切换信息，贯穿整个系统。
+
+8.22 CMake 构建说明补充
+说明：
+- controller 包通过 CMake 将 Pure Pursuit 与 Twist Filter 两个源文件一同编译为控制器节点。
+- boundary_detector 包将第三方 pathplanning 库编译成静态库 pathplanning，然后由 boundary_detector_node 链接。
+- wuta_msgs 包通过 rosidl_generate_interfaces 生成自定义消息接口。
+- lidar_detection 和 ndt_localization 都依赖 PCL 与 pcl_conversions，体现了感知与定位的点云处理特征。
+文件：system/mission_manager/src/mission_manager.cpp
+功能：
+- 是整个系统的状态机总控。
+- 订阅 cone_map、emergency、mission_mode_cmd、lidar_ready、localization_ready、inspection_trigger。
+- 发布 /system/mission_state 和 /system/inspection_result。
+关键逻辑：
+- transitionTo 根据状态变化更新 current_state_。
+- 当系统进入 EXPLORE 时，设置 localization_mode = LOC_KISS_ICP。
+- 当系统进入 RACE 时，设置 localization_mode = LOC_NDT。
+- 当收到 ConeMap 的 is_closed=true 时，进入 MAPPING_DONE。
+- 检测到 emergency 时进入 EMERGENCY。
+
+9. 数据流总结（从传感器到执行）
+--------------------------------
+9.1 感知链路
+- LiDAR 点云 -> lidar_detection -> ConeArray -> cone_map_builder -> ConeMap
+
+9.2 定位链路
+- EKF/robot_localization -> /odometry/filtered -> localization_manager -> /localization/pose
+- NDT -> /ndt/pose -> localization_manager -> /localization/pose
+
+9.3 规划链路
+- ConeMap -> boundary_detector -> /planning/centerline -> path_generator -> /planning/final_waypoints
+- 或者 mission_mode 为 skidpad/acceleration 时，path_generator 直接生成路径，不依赖 centerline。
+
+9.4 控制链路
+- /localization/pose + /planning/final_waypoints + /system/mission_state -> controller -> /control/command
+
+9.5 状态链路
+- mission_manager -> /system/mission_state -> 所有模块
+- 每个模块根据 mission_state 决定自己的工作模式。
+
+10. 设计特点与工程价值
+-----------------------
+- 采用 ROS2 topic 作为模块间通信机制，解耦清晰。
+- 自定义消息包把系统的数据接口统一起来。
+- 任务状态由 mission_manager 集中管理，便于扩展成完整自动驾驶流程。
+- 感知、定位、规划、控制分层明确，便于单独调试。
+- 规划层虽然已经具备路径生成能力，但仍有一些预留接口，例如相机检测、检测融合、CAN 车检等。
+- 控制器逻辑是一个典型的“感知/规划/状态”三输入一输出闭环，非常适合做自动驾驶算法入门与实车移植。
+
+11. 当前工程中值得注意的点
+----------------------------
+- camera_detection 和 detection_fusion 目前仍是框架级占位，尚未实现完整逻辑。
+- mission_manager 中的 inspection 接口已预留，但尚未真正接入传感器检查和 CAN 测试。
+- NDT 定位依赖地图与初始位姿标定，实车调试阶段仍需大量标定。
+- ConeMapBuilder 的 map_save_path 与点云坐标变换仍需要根据实际 TF 树进一步验证。
+- map_saver 当前假设点云已经在地图坐标系，将来应改为使用 TF2 进行正确变换。
+
+12. 推荐启动顺序
+----------------
+建议按照下面顺序启动：
+1. mission_manager
+2. localization_manager 或单独启动 NDT/KISS-ICP 相关节点
+3. lidar_detection
+4. cone_map_builder
+5. boundary_detector
+6. path_generator
+7. controller
+
+13. 一句话总结
+--------------
+整个工程是一个以 ROS2 为骨架、以 topic 通信为核心、以 mission_state 驱动状态切换的自动驾驶赛道算法栈，涵盖了感知、定位、建图、规划、控制与系统管理的完整闭环。

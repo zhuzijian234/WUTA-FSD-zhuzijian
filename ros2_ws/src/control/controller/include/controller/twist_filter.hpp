@@ -5,17 +5,13 @@ namespace controller
 {
 
 /**
- * Safety filter for control commands (from HRT-D TwistFilter, stripped of HPL).
+ * 控制输出的安全滤波器。
  *
- * Velocity:
- *   - Acceleration: slow exponential ramp   (0.9×last + 0.1×input)
- *   - Deceleration: faster response         (0.3×last + 0.7×input)
- *
- * Steering:
- *   - Hard clamp to ±max_steer_angle
- *
- * Emergency:
- *   - If emergency flag set → velocity = 0
+ * Pure Pursuit 计算出的原始命令可能会过于激进，因此这里增加了三层保护：
+ * - 加速时采用缓慢上升，降低打滑风险；
+ * - 减速时响应更快，提升安全性；
+ * - 转向角严格限幅，避免超过车辆物理允许范围；
+ * - 紧急状态下直接置零，确保停车安全。
  */
 class TwistFilter
 {

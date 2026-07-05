@@ -11,7 +11,7 @@ namespace cone_map_builder
 ConeMapBuilder::ConeMapBuilder(const rclcpp::NodeOptions & options)
 : Node("cone_map_builder", options)
 {
-  // Parameters
+  // 参数：控制锥桶融合、闭环判断和地图保存的阈值。
   merge_distance_         = declare_parameter("merge_distance",         merge_distance_);
   min_hit_count_          = declare_parameter("min_hit_count",          min_hit_count_);
   loop_closure_distance_  = declare_parameter("loop_closure_distance",  loop_closure_distance_);
@@ -20,11 +20,11 @@ ConeMapBuilder::ConeMapBuilder(const rclcpp::NodeOptions & options)
   start_skip_distance_    = declare_parameter("start_skip_distance",    start_skip_distance_);
   map_save_path_          = declare_parameter("map_save_path",          map_save_path_);
 
-  // TF2
+  // TF2 用于把传感器坐标系下的锥桶坐标变换到地图坐标系。
   tf_buffer_   = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-  // Separate callback groups so pose (50Hz) is never blocked by slow cone processing
+  // 使用两个 callback group，避免高频位姿消息被慢速锥桶处理阻塞。
   pose_cbg_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   cones_cbg_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
@@ -32,7 +32,7 @@ ConeMapBuilder::ConeMapBuilder(const rclcpp::NodeOptions & options)
   pose_opts.callback_group  = pose_cbg_;
   cones_opts.callback_group = cones_cbg_;
 
-  // Subscribers
+  // 订阅检测到的锥桶和当前定位位姿。
   cones_sub_ = create_subscription<wuta_msgs::msg::ConeArray>(
     "/perception/lidar/cones", 10,
     std::bind(&ConeMapBuilder::onCones, this, std::placeholders::_1), cones_opts);
@@ -85,7 +85,7 @@ void ConeMapBuilder::onCones(const wuta_msgs::msg::ConeArray::SharedPtr msg)
 
 void ConeMapBuilder::integrateDetections(const wuta_msgs::msg::ConeArray & cones_in_sensor_frame)
 {
-  // Transform each cone from sensor frame to map frame using TF2
+  // 用 TF2 把每个锥桶从传感器坐标系转换到地图坐标系。
   const std::string target_frame = "map";
   const std::string source_frame = cones_in_sensor_frame.header.frame_id;
 
@@ -112,7 +112,7 @@ void ConeMapBuilder::integrateDetections(const wuta_msgs::msg::ConeArray & cones
     const double cy = pt_map.point.y;
     const double cz = pt_map.point.z;
 
-    // Search for existing cone within merge_distance
+    // 在当前地图中查找距离很近的旧锥桶，若存在则进行融合，而不是重复添加。
     bool merged = false;
     for (auto & tracked : cone_map_) {
       const double dx = cx - tracked.x;
@@ -179,7 +179,7 @@ uint8_t ConeMapBuilder::assignColor(double cone_x_map, double cone_y_map) const
 bool ConeMapBuilder::checkLoopClosure()
 {
   if (!start_pose_set_) return false;
-
+  // 通过判断当前车辆是否回到起点附近，来判断地图是否闭合。
   // Need minimum cones before considering closure
   const int confirmed_cones = std::count_if(cone_map_.begin(), cone_map_.end(),
     [this](const TrackedCone & c) { return c.hit_count >= min_hit_count_; });

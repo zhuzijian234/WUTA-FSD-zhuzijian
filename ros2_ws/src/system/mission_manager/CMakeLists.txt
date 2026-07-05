@@ -8,6 +8,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(wuta_msgs REQUIRED)
 
+# 任务管理器是系统的状态总线，决定是否进入探索、建图、竞速、停止或应急状态。
 add_executable(mission_manager_node
   src/mission_manager.cpp
 )

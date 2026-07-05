@@ -17,7 +17,7 @@ wuta_msgs::msg::ConeArray TraditionalDetector::detect(const PointCloud::ConstPtr
 {
   wuta_msgs::msg::ConeArray result;
 
-  // 1. Range filter: discard points beyond max detection range
+  // 1. 范围滤波：去掉距离传感器过远的点，减少后续计算量。
   PointCloud::Ptr range_filtered(new PointCloud);
   for (const auto & pt : cloud->points) {
     if (pt.x * pt.x + pt.y * pt.y < cfg_.max_detection_range * cfg_.max_detection_range) {
@@ -25,18 +25,18 @@ wuta_msgs::msg::ConeArray TraditionalDetector::detect(const PointCloud::ConstPtr
     }
   }
 
-  // 2. Ground removal
+  // 2. 地面去除：把地面点从点云中剔除，避免把地面误识别成锥桶。
   PointCloud::Ptr no_ground = removeGround(range_filtered);
   if (no_ground->empty()) return result;
 
-  // 3. Voxel downsampling
+  // 3. 体素下采样：压缩点云密度，保留主要几何结构。
   PointCloud::Ptr downsampled = voxelDownsample(no_ground);
   if (downsampled->empty()) return result;
 
-  // 4. Euclidean clustering
+  // 4. 欧氏聚类：把相邻且紧密的点分成若干簇，分别对应一个候选锥桶。
   auto clusters = euclideanCluster(downsampled);
 
-  // 5. Cone shape filter → centroid extraction
+  // 5. 锥桶形状筛选：对每个聚类簇做尺寸检查，确认它是否像锥桶，再取质心作为检测结果。
   for (const auto & cluster : clusters) {
     if (!isConeShape(cluster)) continue;
 

@@ -10,7 +10,8 @@ BoundaryDetectorNode::BoundaryDetectorNode(const rclcpp::NodeOptions & options)
   lookahead_distance_ = declare_parameter("lookahead_distance", lookahead_distance_);
   desired_velocity_   = declare_parameter("desired_velocity",   desired_velocity_);
 
-  // Subscribers
+  // 订阅者：从锥桶地图、当前位姿和任务状态中提取当前赛道边界中心线。
+  // 从锥桶地图、当前位姿和任务状态中提取当前赛道边界中心线。
   cone_map_sub_ = create_subscription<wuta_msgs::msg::ConeMap>(
     "/mapping/cone_map", 10,
     std::bind(&BoundaryDetectorNode::onConeMap, this, std::placeholders::_1));
@@ -23,7 +24,7 @@ BoundaryDetectorNode::BoundaryDetectorNode(const rclcpp::NodeOptions & options)
     "/system/mission_state", 10,
     std::bind(&BoundaryDetectorNode::onMissionState, this, std::placeholders::_1));
 
-  // Publishers
+  // 发布者：输出当前赛道中心线，供路径生成器使用。
   centerline_pub_ = create_publisher<autoware_msgs::msg::Lane>("/planning/centerline", 10);
   marker_pub_     = create_publisher<visualization_msgs::msg::MarkerArray>(
     "/planning/centerline_viz", 10);
@@ -46,11 +47,11 @@ void BoundaryDetectorNode::onConeMap(const wuta_msgs::msg::ConeMap::SharedPtr ms
 {
   if (!pose_ready_) return;
 
-  // Only TRACKDRIVE uses Delaunay boundary detection
-  // SKIDPAD and ACCELERATION handle their own path in path_generator
+  // 只有 trackdrive 模式才使用 Delaunay 的边界检测。
+  // skidpad 和 acceleration 的路径由 path_generator 自己生成，因此这里不用处理。
   if (mission_mode_ != wuta_msgs::msg::MissionState::MISSION_TRACKDRIVE) return;
 
-  // Build merged cone list (blue + yellow + unknown)
+  // 将 ConeMap 中的蓝/黄/未知锥桶转换成点集，供 Delaunay 算法使用。
   auto points = coneMapToPoints(*msg);
   if (points.size() < 4) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -58,6 +59,7 @@ void BoundaryDetectorNode::onConeMap(const wuta_msgs::msg::ConeMap::SharedPtr ms
     return;
   }
 
+  // 由 Delaunay 搜索得到一条中间线，也就是赛道中心线。
   auto lane = computeCenterline(points);
   if (lane.waypoints.empty()) return;
 

@@ -8,22 +8,23 @@ using MissionState = wuta_msgs::msg::MissionState;
 LocalizationManager::LocalizationManager(const rclcpp::NodeOptions & options)
 : Node("localization_manager", options)
 {
-  // Subscriptions
+  // 订阅任务状态，决定当前采用 EKF 还是 NDT 定位输出。
   mission_sub_ = create_subscription<MissionState>(
     "/system/mission_state", 10,
     std::bind(&LocalizationManager::onMissionState, this, std::placeholders::_1));
 
-  // EKF output (robot_localization) — active in EXPLORE mode
+  // EKF 输出订阅：在 EXPLORE 模式下启用，表示定位使用 KISS-ICP + EKF。
   ekf_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     "/odometry/filtered", 10,
     std::bind(&LocalizationManager::onEkfOdom, this, std::placeholders::_1));
 
-  // NDT output — active in RACE mode
+  // NDT 输出订阅：在 RACE 模式下启用，表示定位使用地图匹配。
   ndt_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
     "/ndt/pose", 10,
     std::bind(&LocalizationManager::onNdtPose, this, std::placeholders::_1));
 
-  // Publishers
+  // 发布者：统一输出给规划和控制层的定位结果。
+  // 统一对外输出当前可用于规划和控制的定位结果，屏蔽底层 EKF/NDT 的差异。
   pose_pub_  = create_publisher<geometry_msgs::msg::PoseStamped>("/localization/pose", 10);
   ready_pub_ = create_publisher<std_msgs::msg::Bool>("/system/localization_ready", 10);
 

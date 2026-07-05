@@ -10,7 +10,8 @@ find_package(visualization_msgs REQUIRED)
 find_package(wuta_msgs REQUIRED)
 find_package(autoware_msgs REQUIRED)
 
-# HRT-D pathplanning algorithm library (pure C++, no ROS)
+# 该包会把 thirdparty/pathplanning 的纯 C++ 算法库编译成静态库。
+# boundary_detector_node 再链接它，完成 Delaunay 三角剖分与中间线生成。
 file(GLOB PATHPLANNING_SRCS thirdparty/pathplanning/src/*.cpp)
 
 add_library(pathplanning STATIC ${PATHPLANNING_SRCS})

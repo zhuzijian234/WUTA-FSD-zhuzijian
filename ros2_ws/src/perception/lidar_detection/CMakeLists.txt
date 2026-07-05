@@ -11,6 +11,8 @@ find_package(wuta_msgs REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters segmentation search kdtree)
 find_package(pcl_conversions REQUIRED)
 
+# 感知节点由主控制逻辑和多个检测后端组成。
+# 这里默认编译 traditional_detector 和 DL 接口实现。
 add_executable(lidar_detection_node
   src/lidar_detection_node.cpp
   src/traditional_detector.cpp

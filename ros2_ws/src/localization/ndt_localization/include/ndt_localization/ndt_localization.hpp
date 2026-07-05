@@ -17,21 +17,22 @@ namespace ndt_localization
 {
 
 /**
- * NdtLocalization
+ * NDT 定位节点。
  *
- * Loads a prior point cloud map (built by MapSaver during EXPLORE) and
- * runs NDT scan matching on each incoming LiDAR frame to estimate pose.
+ * 该节点负责把预先保存好的点云地图与当前 LiDAR 扫描帧做配准，
+ * 从而估计车辆在地图坐标系中的位姿。它是“竞速阶段高精度定位”的
+ * 核心模块，输出结果会被 localization_manager 统一转发给规划与控制。
  *
- * Only active when MissionState == RACE (LOC_NDT mode).
- * Output: /ndt/pose → consumed by LocalizationManager.
+ * 工作流程：
+ * 1. 订阅 /system/mission_state，只有在 LOC_NDT 模式下才启用 NDT；
+ * 2. 订阅 /initialpose，作为初始匹配位姿；
+ * 3. 订阅 /hesai/pandar，使用 PCL/NDT 对每帧点云做配准；
+ * 4. 发布 /ndt/pose、/ndt/path、/ndt/aligned_cloud 供后续模块使用。
  *
- * Initial pose must be provided via /initialpose (e.g. from RViz2 or
- * a fixed startup config aligned to the saved map).
- *
- * TODO (requires real vehicle data):
- *   - Tune ndt_resolution, step_size, max_iterations for Hesai 128-line
- *   - Fill in LiDAR→base_link extrinsic calibration
- *   - Validate map→odom→base_link TF chain
+ * TODO（实际车上调试时需要继续完善）：
+ * - 根据 Hesai 128 线雷达调优 ndt_resolution、step_size、max_iterations；
+ * - 补齐 LiDAR 到 base_link 的外参；
+ * - 验证 map → odom → base_link 的 TF 链是否完整。
  */
 class NdtLocalization : public rclcpp::Node
 {
@@ -63,8 +64,8 @@ private:
   // Parameters
   std::string map_path_{"/tmp/wuta_lidar_map.pcd"};
 
-  // NDT tuning — TODO: calibrate on real vehicle
-  double ndt_resolution_{1.0};       // m — voxel size of NDT map
+  // NDT 调参 —— TODO: 需要在真实车辆上进一步标定
+  double ndt_resolution_{1.0};       // m —— NDT 栅格地图的体素尺寸
   double step_size_{0.1};            // m — Newton step size
   double transform_epsilon_{0.01};   // convergence criterion
   int    max_iterations_{30};

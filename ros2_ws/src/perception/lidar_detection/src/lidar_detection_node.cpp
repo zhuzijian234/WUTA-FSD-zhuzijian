@@ -11,7 +11,7 @@ namespace lidar_detection
 LidarDetectionNode::LidarDetectionNode(const rclcpp::NodeOptions & options)
 : Node("lidar_detection_node", options)
 {
-  // --- Parameters ---
+  // 从参数服务器读取检测器类型，当前默认使用传统 PCL 检测器。
   const std::string detector_type = declare_parameter<std::string>("detector_type", "traditional");
 
   // Traditional detector config from parameters
@@ -28,7 +28,7 @@ LidarDetectionNode::LidarDetectionNode(const rclcpp::NodeOptions & options)
   cfg.min_cone_height         = declare_parameter("min_cone_height",          cfg.min_cone_height);
   cfg.max_detection_range     = declare_parameter("max_detection_range",      cfg.max_detection_range);
 
-  // --- Detector factory ---
+  // 根据参数选择后台检测器：传统 PCL 或深度学习接口。
   if (detector_type == "traditional") {
     detector_ = std::make_unique<TraditionalDetector>(cfg);
     RCLCPP_INFO(get_logger(), "Using traditional PCL detector");
@@ -41,7 +41,7 @@ LidarDetectionNode::LidarDetectionNode(const rclcpp::NodeOptions & options)
     throw std::runtime_error("Unknown detector_type: " + detector_type);
   }
 
-  // --- Topics ---
+  // 订阅点云输入主题和发布检测结果主题。
   const std::string input_topic  = declare_parameter<std::string>("input_topic",  "/hesai/pandar");
   const std::string output_topic = declare_parameter<std::string>("output_topic", "/perception/lidar/cones");
 
@@ -58,12 +58,15 @@ LidarDetectionNode::LidarDetectionNode(const rclcpp::NodeOptions & options)
 
 void LidarDetectionNode::onPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
+  // 把 ROS 的 PointCloud2 转成 PCL 点云对象，供检测器处理。
   PointCloud::Ptr cloud(new PointCloud);
   pcl::fromROSMsg(*msg, *cloud);
 
+  // 调用当前选定的检测器后端，得到 ConeArray 结果。
   auto cones = detector_->detect(cloud);
   cones.header = msg->header;
 
+  // 发布检测结果，供后续建图和融合模块使用。
   cone_pub_->publish(cones);
 
   if (marker_pub_->get_subscription_count() > 0) {

@@ -15,7 +15,7 @@ find_package(PCL REQUIRED COMPONENTS common io filters registration)
 find_package(pcl_conversions REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-# NDT localization node
+# NDT 定位节点：负责根据预先保存的地图对实时 LiDAR 扫描做匹配。
 add_executable(ndt_localization_node
   src/ndt_localization.cpp
 )
@@ -29,7 +29,7 @@ ament_target_dependencies(ndt_localization_node
   rclcpp sensor_msgs geometry_msgs nav_msgs wuta_msgs pcl_conversions
 )
 
-# Map saver node
+# 地图保存节点：在建图阶段累积点云并在任务结束时输出 PCD 地图。
 add_executable(map_saver_node
   src/map_saver.cpp
 )

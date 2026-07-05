@@ -6,16 +6,16 @@ namespace lidar_detection
 {
 
 /**
- * Placeholder interface for deep learning-based cone detection.
+ * 深度学习锥桶检测的占位接口。
  *
- * Future implementations:
- *   - PointPillars: pillars-based 3D object detection
- *   - CenterPoint:  center-based heatmap detection
+ * 未来可扩展的实现方案：
+ *   - PointPillars: 基于 pillar 的 3D 目标检测
+ *   - CenterPoint: 基于中心点热力图的检测
  *
- * To integrate:
- *   1. Implement this class with model loading (ONNX / Horizon BPU .bin)
- *   2. Set detector_type: "dl" in lidar_detection.yaml
- *   3. The LidarDetectionNode will automatically use this backend
+ * 接入步骤：
+ *   1. 实现模型加载逻辑（ONNX / Horizon BPU .bin）
+ *   2. 在 lidar_detection.yaml 中将 detector_type 设为 "dl"
+ *   3. LidarDetectionNode 会自动使用该后端
  */
 class DLDetector : public IDetector
 {
@@ -26,7 +26,7 @@ public:
 
 private:
   std::string model_path_;
-  // TODO: model handle (e.g. horizon BPU context, TensorRT engine, ONNX session)
+  // TODO: 模型句柄（例如 Horizon BPU 上下文、TensorRT 引擎、ONNX 会话）
 };
 
 }  // namespace lidar_detection

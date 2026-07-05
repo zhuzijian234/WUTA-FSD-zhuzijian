@@ -11,6 +11,8 @@ namespace ndt_localization
 MapSaver::MapSaver(const rclcpp::NodeOptions & options)
 : Node("map_saver", options)
 {
+  // 地图保存节点负责在 EXPLORE 阶段累计点云，等系统完成闭环后把地图写入磁盘。
+  // 它是 NDT 定位所需先验地图的生成器。
   map_save_path_    = declare_parameter("map_save_path",    map_save_path_);
   voxel_size_       = declare_parameter("voxel_size",       voxel_size_);
   accumulate_dist_  = declare_parameter("accumulate_dist",  accumulate_dist_);
@@ -41,9 +43,11 @@ void MapSaver::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg)
 
 void MapSaver::onMissionState(const wuta_msgs::msg::MissionState::SharedPtr msg)
 {
+  // 只要 mission_manager 进入 MAPPING_DONE，就说明建图阶段结束，
+  // 此时应该把积累的点云保存成可供 NDT 使用的 PCD 文件。
   using State = wuta_msgs::msg::MissionState;
 
-  // Trigger save when exploration is done
+  // 当系统进入 MAPPING_DONE 时，触发地图保存。
   if (msg->state == State::MAPPING_DONE && !map_saved_) {
     RCLCPP_INFO(get_logger(), "MAPPING_DONE received. Saving map...");
     saveMap();
@@ -52,7 +56,9 @@ void MapSaver::onMissionState(const wuta_msgs::msg::MissionState::SharedPtr msg)
 
 void MapSaver::onPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
-  // Only accumulate during EXPLORE (before map_saved)
+  // 在地图尚未保存前持续积累点云，避免重复保存或重复叠加相同场景。
+  // 每次只有车辆移动超过阈值时才追加新的点云。
+  // 只在地图尚未保存时累积点云，避免重复保存。
   if (map_saved_) return;
 
   const double cx = latest_odom_.pose.pose.position.x;
@@ -60,7 +66,7 @@ void MapSaver::onPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   const double dx = cx - last_accumulate_x_;
   const double dy = cy - last_accumulate_y_;
 
-  // Only add cloud if vehicle has moved far enough (avoid redundant overlap)
+  // 只有车辆位置移动足够远时才追加点云，避免重复叠加同一场景。
   if (std::sqrt(dx * dx + dy * dy) < accumulate_dist_ && accumulated_map_->size() > 0) {
     return;
   }
@@ -75,8 +81,8 @@ void MapSaver::accumulateCloud(const sensor_msgs::msg::PointCloud2::SharedPtr ms
   PointCloud::Ptr cloud(new PointCloud);
   pcl::fromROSMsg(*msg, *cloud);
 
-  // TODO: transform cloud from sensor frame to map frame using TF2
-  // For now, assumes cloud is already in map frame (requires KISS-ICP TF)
+  // TODO: 使用 TF2 把点云从传感器坐标系变换到地图坐标系
+  // 目前先假设点云已经处于地图坐标系中，这依赖 KISS-ICP 的 TF 输出
 
   *accumulated_map_ += *cloud;
 

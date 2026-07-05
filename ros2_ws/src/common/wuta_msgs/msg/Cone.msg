@@ -1,5 +1,5 @@
 # Single cone detection
-# Color constants
+# 锥桶颜色常量：用于区分不同边界和状态。
 uint8 COLOR_UNKNOWN = 0
 uint8 COLOR_BLUE    = 1
 uint8 COLOR_YELLOW  = 2
