@@ -1,0 +1,527 @@
+================================================================================
+  WUTA-FSD 模拟器 — 赛道加载器 (track_loader.py) + 可视化 + launch文件
+================================================================================
+
+第一部分：赛道加载器 (track_loader.py)
+──────────────────────────────────────────────────────────────────────────────
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+  输入: YAML 赛道文件路径
+  输出:
+    1. 锥筒全局坐标列表 → lidar_simulator
+    2. start_pose → vehicle_model
+    3. 赛道类型 → mission_manager
+    4. 锥筒可视化 → RViz2
+
+二、支持的 YAML 格式（两种，兼容真实建图结果）
+─────────────────────────────────────────────────────────────────
+
+  格式1: 仿真器赛道格式 (track:)
+  ────────────────────────────────
+    track:
+      name: "..."
+      type: trackdrive | skidpad | acceleration
+      start_pose:
+        x: 0.0
+        y: 0.0
+        yaw: 0.0
+      blue_cones:
+        - [1.5, 5.0, 0.0]
+        ...
+      yellow_cones:
+        - [1.5, -5.0, 0.0]
+      orange_cones:
+        - [10.0, 0.0, 0.0]
+      unknown_cones:
+        - [15.0, 2.0, 0.0]
+
+  格式2: cone_map_builder 保存格式 (cone_map:)
+  ────────────────────────────────────────────
+    cone_map:
+      - x: 1.5
+        y: 5.0
+        z: 0.0
+        color: 1     # 1=BLUE, 2=YELLOW, 3=ORANGE, 0=UNKNOWN
+        hit_count: 3
+      - x: 2.0
+        y: 5.5
+        z: 0.0
+        color: 1
+        hit_count: 5
+
+三、完整的 TrackLoader 实现
+──────────────────────────────────────────────────────────────────────────────
+
+import yaml
+import os
+import math
+
+
+class TrackLoader:
+
+    # 颜色常量（与 wuta_msgs/Cone.msg 一致）
+    COLOR_UNKNOWN = 0
+    COLOR_BLUE    = 1
+    COLOR_YELLOW  = 2
+    COLOR_ORANGE  = 3
+
+    def __init__(self, yaml_path: str):
+        """
+        加载赛道 YAML 文件
+
+        Args:
+            yaml_path: YAML 文件的完整路径
+
+        Raises:
+            FileNotFoundError: 文件不存在
+            ValueError: YAML 格式无效
+        """
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(f"Track file not found: {yaml_path}")
+
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            self.raw_data = yaml.safe_load(f)
+
+        if self.raw_data is None:
+            raise ValueError(f"Empty or invalid YAML: {yaml_path}")
+
+        self._parse()
+
+    def _parse(self):
+        """解析 YAML 数据，填充内部结构"""
+
+        # ──── 判断格式类型 ────
+        if 'track' in self.raw_data:
+            self._parse_track_format(self.raw_data['track'])
+        elif 'cone_map' in self.raw_data:
+            self._parse_conemap_format(self.raw_data['cone_map'])
+        else:
+            raise ValueError(
+                "YAML must contain 'track' or 'cone_map' top-level key. "
+                f"Found keys: {list(self.raw_data.keys())}"
+            )
+
+    def _parse_track_format(self, data: dict):
+        """解析 track: 格式（仿真器专用）"""
+
+        # ── 赛道信息 ──
+        self.name = data.get('name', 'Unnamed Track')
+        self.track_type = data.get('type', 'trackdrive')
+
+        # 验证类型
+        valid_types = ['trackdrive', 'skidpad', 'acceleration']
+        if self.track_type not in valid_types:
+            raise ValueError(
+                f"Unknown track type: {self.track_type}. "
+                f"Must be one of {valid_types}"
+            )
+
+        # ── 起始位姿 ──
+        sp = data.get('start_pose', {})
+        self.start_x   = sp.get('x', 0.0)
+        self.start_y   = sp.get('y', 0.0)
+        self.start_yaw = sp.get('yaw', 0.0)
+        self.start_z   = sp.get('z', 0.0)
+
+        # ── 锥筒列表 ──
+        # 统一为 [(x, y, z, color), ...] 格式
+        self.blue_cones    = self._parse_cone_list(data.get('blue_cones', []),
+                                                    self.COLOR_BLUE)
+        self.yellow_cones  = self._parse_cone_list(data.get('yellow_cones', []),
+                                                    self.COLOR_YELLOW)
+        self.orange_cones  = self._parse_cone_list(data.get('orange_cones', []),
+                                                    self.COLOR_ORANGE)
+        self.unknown_cones = self._parse_cone_list(data.get('unknown_cones', []),
+                                                    self.COLOR_UNKNOWN)
+
+        # ── 全部锥筒（扁平化）──
+        self.all_cones = (
+            self.blue_cones + self.yellow_cones +
+            self.orange_cones + self.unknown_cones
+        )
+
+    def _parse_conemap_format(self, data: list):
+        """解析 cone_map: 格式（与 cone_map_builder 保存格式兼容）"""
+
+        # 默认值（cone_map 格式不含元信息）
+        self.name = "Loaded from cone_map"
+        self.track_type = "trackdrive"
+
+        # 没有起始位姿信息，使用 (0,0,0)
+        self.start_x = 0.0
+        self.start_y = 0.0
+        self.start_yaw = 0.0
+        self.start_z = 0.0
+
+        self.blue_cones    = []
+        self.yellow_cones  = []
+        self.orange_cones  = []
+        self.unknown_cones = []
+
+        for cone in data:
+            x = cone.get('x', 0.0)
+            y = cone.get('y', 0.0)
+            z = cone.get('z', 0.0)
+            color = cone.get('color', self.COLOR_UNKNOWN)
+
+            entry = (x, y, z, color)
+            if color == self.COLOR_BLUE:
+                self.blue_cones.append(entry)
+            elif color == self.COLOR_YELLOW:
+                self.yellow_cones.append(entry)
+            elif color == self.COLOR_ORANGE:
+                self.orange_cones.append(entry)
+            else:
+                self.unknown_cones.append(entry)
+
+        self.all_cones = (
+            self.blue_cones + self.yellow_cones +
+            self.orange_cones + self.unknown_cones
+        )
+
+    @staticmethod
+    def _parse_cone_list(cone_list: list, color: int) -> list:
+        """
+        将 [[x,y,z], ...] 格式的列表转为 [(x,y,z,color), ...]
+
+        Args:
+            cone_list: [[x, y, z], [x, y, z], ...]
+            color: 颜色常量
+
+        Returns:
+            [(x, y, z, color), ...]
+        """
+        result = []
+        for entry in cone_list:
+            if isinstance(entry, list) and len(entry) >= 2:
+                x = float(entry[0])
+                y = float(entry[1])
+                z = float(entry[2]) if len(entry) >= 3 else 0.0
+                result.append((x, y, z, color))
+            elif isinstance(entry, dict):
+                # 也支持 {x: 1.0, y: 2.0, z: 0.0} 格式
+                x = float(entry.get('x', 0.0))
+                y = float(entry.get('y', 0.0))
+                z = float(entry.get('z', 0.0))
+                result.append((x, y, z, color))
+        return result
+
+    def get_mission_mode(self) -> int:
+        """将赛道类型映射为 MissionState 的 mission_mode"""
+        mapping = {
+            'trackdrive':   0,  # MISSION_TRACKDRIVE
+            'skidpad':      1,  # MISSION_SKIDPAD
+            'acceleration': 2,  # MISSION_ACCELERATION
+        }
+        return mapping.get(self.track_type, 0)
+
+    def summary(self) -> str:
+        """返回赛道摘要信息"""
+        return (
+            f"Track: {self.name}\n"
+            f"  Type:       {self.track_type}\n"
+            f"  Start Pose: ({self.start_x:.1f}, {self.start_y:.1f}, "
+            f"yaw={math.degrees(self.start_yaw):.1f}°)\n"
+            f"  Blue cones:    {len(self.blue_cones)}\n"
+            f"  Yellow cones:  {len(self.yellow_cones)}\n"
+            f"  Orange cones:  {len(self.orange_cones)}\n"
+            f"  Unknown cones: {len(self.unknown_cones)}\n"
+            f"  Total cones:   {len(self.all_cones)}"
+        )
+
+四、使用示例
+──────────────────────────────────────────────────────────────────────────────
+
+  # 加载赛道
+  loader = TrackLoader('tracks/trackdrive.yaml')
+  print(loader.summary())
+
+  # 获取锥筒（传给 lidar_simulator）
+  lidar_sim.set_cones(loader.all_cones)
+
+  # 设置车辆起始位姿
+  vehicle_model.set_start_pose(
+      loader.start_x, loader.start_y, loader.start_yaw)
+
+  # 设置任务模式
+  mission_mode = loader.get_mission_mode()
+  # trackdrive→0, skidpad→1, acceleration→2
+
+五、Python 脚本生成赛道
+──────────────────────────────────────────────────────────────────────────────
+
+  简单赛道的生成脚本示例:
+
+  def generate_straight_track(length=50, width=3, spacing=3):
+      """生成直线赛道 YAML"""
+      blue_cones = []
+      yellow_cones = []
+      for xi in range(0, length + 1, spacing):
+          blue_cones.append([float(xi), width/2, 0.0])
+          yellow_cones.append([float(xi), -width/2, 0.0])
+
+      track = {
+          'track': {
+              'name': f'Straight {length}m',
+              'type': 'trackdrive',
+              'start_pose': {'x': 0.0, 'y': 0.0, 'yaw': 0.0},
+              'blue_cones': blue_cones,
+              'yellow_cones': yellow_cones,
+              'orange_cones': [[0.0, width/2, 0.0], [0.0, -width/2, 0.0]],
+          }
+      }
+      return track
+
+  def generate_skidpad_track():
+      """生成 FSG Skidpad 赛道"""
+      import math
+      R = 9.125  # 半径
+      N = 18     # 每圈锥筒数
+
+      right_cx, right_cy = 0.0, R
+      left_cx, left_cy = 0.0, -R
+
+      orange_cones = []
+      for i in range(N):
+          theta = 2 * math.pi * i / N
+          # 右圆
+          orange_cones.append([
+              right_cx + R * math.cos(theta),
+              right_cy + R * math.sin(theta),
+              0.0
+          ])
+          # 左圆
+          orange_cones.append([
+              left_cx + R * math.cos(theta),
+              left_cy + R * math.sin(theta),
+              0.0
+          ])
+
+      return {
+          'track': {
+              'name': 'FSG Skidpad',
+              'type': 'skidpad',
+              'start_pose': {'x': 0.0, 'y': 0.0, 'yaw': 0.0},
+              'blue_cones': [],
+              'yellow_cones': [],
+              'orange_cones': orange_cones,
+          }
+      }
+
+──────────────────────────────────────────────────────────────────────────────
+
+第二部分：可视化节点 (visualization.py)
+──────────────────────────────────────────────────────────────────────────────
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+  发布赛道锥筒和车辆轨迹的 RViz2 可视化消息。
+
+二、伪代码实现
+──────────────────────────────────────────────────────────────────────────────
+
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+import math
+
+
+class TrackVisualizer:
+
+    def __init__(self, node: Node):
+        self.node = node
+        self.marker_pub = node.create_publisher(
+            MarkerArray, '/sim/track_viz', 10)
+
+    def publish_cones(self, track_loader: TrackLoader):
+        """发布锥筒可视化"""
+        marker_array = MarkerArray()
+
+        # ── 删除旧标记 ──
+        del_marker = Marker()
+        del_marker.action = Marker.DELETEALL
+        marker_array.markers.append(del_marker)
+
+        marker_id = 0
+
+        # ── 蓝色锥筒 ──
+        for x, y, z, _ in track_loader.blue_cones:
+            m = self._make_cone_marker(marker_id, x, y, z, 0.0, 0.4, 1.0)
+            marker_array.markers.append(m)
+            marker_id += 1
+
+        # ── 黄色锥筒 ──
+        for x, y, z, _ in track_loader.yellow_cones:
+            m = self._make_cone_marker(marker_id, x, y, z, 1.0, 0.9, 0.0)
+            marker_array.markers.append(m)
+            marker_id += 1
+
+        # ── 橙色锥筒 ──
+        for x, y, z, _ in track_loader.orange_cones:
+            m = self._make_cone_marker(marker_id, x, y, z, 1.0, 0.5, 0.0)
+            marker_array.markers.append(m)
+            marker_id += 1
+
+        self.marker_pub.publish(marker_array)
+
+    def _make_cone_marker(self, id, x, y, z, r, g, b):
+        """创建一个锥筒标记（圆柱体）"""
+        m = Marker()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.node.get_clock().now().to_msg()
+        m.ns = 'track_cones'
+        m.id = id
+        m.type = Marker.CYLINDER
+        m.action = Marker.ADD
+        m.pose.position.x = x
+        m.pose.position.y = y
+        m.pose.position.z = z + 0.25  # 抬高到锥筒半高
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.3      # 直径
+        m.scale.y = 0.3
+        m.scale.z = 0.5      # 高度（锥筒典型高度）
+        m.color.r = r
+        m.color.g = g
+        m.color.b = b
+        m.color.a = 0.8
+        return m
+
+──────────────────────────────────────────────────────────────────────────────
+
+第三部分：Launch 文件
+──────────────────────────────────────────────────────────────────────────────
+
+三、simulator_mode_a.launch.py（跳过定位）
+──────────────────────────────────────────────────────────────────────────────
+
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from launch.actions import TimerAction
+from launch.substitutions import PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+
+    # ── 仿真器节点 ──
+    vehicle_model_node = Node(
+        package='wuta_simulator',
+        executable='vehicle_model',
+        name='vehicle_model',
+        parameters=[
+            PathJoinSubstitution([
+                FindPackageShare('wuta_simulator'),
+                'config', 'simulator.yaml'
+            ])
+        ],
+        output='screen',
+    )
+
+    lidar_sim_node = Node(
+        package='wuta_simulator',
+        executable='lidar_simulator',
+        name='lidar_simulator',
+        parameters=[...],
+        output='screen',
+    )
+
+    ins_sim_node = Node(
+        package='wuta_simulator',
+        executable='ins_simulator',
+        name='ins_simulator',
+        output='screen',
+    )
+
+    can_sim_node = Node(
+        package='wuta_simulator',
+        executable='can_simulator',
+        name='can_simulator',
+        output='screen',
+    )
+
+    viz_node = Node(
+        package='wuta_simulator',
+        executable='track_visualizer',
+        name='track_visualizer',
+        output='screen',
+    )
+
+    # ── FSD 管线节点 ──
+    mission_node = Node(
+        package='mission_manager',
+        executable='mission_manager_node',
+        name='mission_manager',
+        parameters=[{'mission_mode': 'trackdrive'}],
+        output='screen',
+    )
+
+    lidar_detection_node = Node(
+        package='lidar_detection',
+        executable='lidar_detection_node',
+        name='lidar_detection_node',
+        parameters=[
+            PathJoinSubstitution([
+                FindPackageShare('lidar_detection'),
+                'config', 'lidar_detection.yaml'
+            ])
+        ],
+        output='screen',
+    )
+
+    cone_map_node = Node(
+        package='cone_map_builder',
+        executable='cone_map_builder_node',
+        name='cone_map_builder',
+        output='screen',
+    )
+
+    boundary_node = Node(
+        package='boundary_detector',
+        executable='boundary_detector_node',
+        name='boundary_detector',
+        output='screen',
+    )
+
+    path_gen_node = Node(
+        package='path_generator',
+        executable='path_generator_node',
+        name='path_generator',
+        output='screen',
+    )
+
+    controller_node = Node(
+        package='controller',
+        executable='controller_node',
+        name='controller_node',
+        parameters=[
+            PathJoinSubstitution([
+                FindPackageShare('controller'),
+                'config', 'controller.yaml'
+            ])
+        ],
+        output='screen',
+    )
+
+    # ── 启动顺序: 仿真器先启动，FSD 管线延迟 2s ──
+    return LaunchDescription([
+        # 仿真器节点（立即启动）
+        vehicle_model_node,
+        lidar_sim_node,
+        ins_sim_node,
+        can_sim_node,
+        viz_node,
+
+        # FSD 管线节点（延迟启动，确保传感器数据已就绪）
+        TimerAction(period=1.0, actions=[mission_node]),
+        TimerAction(period=1.0, actions=[lidar_detection_node]),
+        TimerAction(period=1.5, actions=[cone_map_node]),
+        TimerAction(period=2.0, actions=[boundary_node]),
+        TimerAction(period=2.0, actions=[path_gen_node]),
+        TimerAction(period=2.0, actions=[controller_node]),
+    ])
+
+================================================================================
+  下一步: 请阅读 07_开发计划与里程碑.txt
+================================================================================

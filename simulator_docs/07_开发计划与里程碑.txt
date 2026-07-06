@@ -1,0 +1,308 @@
+================================================================================
+  WUTA-FSD 模拟器 — 开发计划与里程碑
+================================================================================
+
+一、总体时间线
+──────────────────────────────────────────────────────────────────────────────
+
+  第一期（模式A）：验证规划控制链路       预计 3-5 天
+  第二期（模式B）：全仿真 + 定位验证       预计 2-3 天
+  第三期（赛道 + 指标）：多场景 + 评估    预计 2-3 天
+
+──────────────────────────────────────────────────────────────────────────────
+
+二、第一期：模式A — 跳过定位，验证规划控制（优先级最高）
+──────────────────────────────────────────────────────────────────────────────
+
+目标: 在不启动 KISS-ICP 和 EKF 的情况下，验证从感知到控制的完整链路。
+
+Day 1: 包骨架 + 基础模块
+─────────────────────────
+
+  □ 1.1 创建 wuta_simulator 包骨架
+      - 创建目录结构
+      - 编写 package.xml, setup.py, setup.cfg
+      - 创建 __init__.py
+      - 验证: colcon build 成功
+
+  □ 1.2 实现 TrackLoader
+      - 编写 track_loader.py
+      - 支持 track: 格式解析
+      - 支持 cone_map: 格式解析
+      - 单元测试: 加载 trackdrive.yaml, skidpad.yaml, acceleration.yaml
+      - 验证: print(summary()) 输出正确
+
+  □ 1.3 生成 3 个标准赛道 YAML
+      - tracks/trackdrive.yaml（直道+弯道，约100m）
+      - tracks/skidpad.yaml（FSG 标准八字）
+      - tracks/acceleration.yaml（75m 直线）
+
+Day 2: 车辆模型 + 简单传感器
+─────────────────────────────
+
+  □ 2.1 实现 VehicleModel
+      - 编写 vehicle_model.py
+      - 自行车运动学模型
+      - 发布 /sim/ground_truth
+      - 单元测试: 直线行驶、最大转角、静止打方向盘
+      - 验证: ros2 topic echo /sim/ground_truth 看位姿变化
+
+  □ 2.2 实现 CanSimulator
+      - 编写 can_simulator.py
+      - 发布 /localization/velocity
+      - 验证: ros2 topic echo /localization/velocity
+
+  □ 2.3 实现 InsSimulator
+      - 编写 ins_simulator.py
+      - 添加高斯噪声
+      - 填充协方差矩阵
+      - 发布 /cg410/odometry
+      - 验证: ros2 topic echo /cg410/odometry
+
+  □ 2.4 VehicleModel 直发 /localization/pose (模式A)
+      - 在 vehicle_model 中添加 /localization/pose 发布
+      - 验证: ros2 topic echo /localization/pose
+
+Day 3: LiDAR 模拟器
+───────────────────
+
+  □ 3.1 实现 LidarSimulator 基础版
+      - 编写 lidar_simulator.py
+      - 坐标变换 (map → hesai)
+      - FOV 过滤
+      - 生成锥筒表面点
+      - 验证: ros2 topic echo /hesai/pandar
+
+  □ 3.2 添加地面点
+      - 生成 200-500 个地面点
+      - 验证: RANSAC 地面分割能正常找到平面
+
+  □ 3.3 添加遮挡检测
+      - 按距离排序
+      - 角度接近的锥筒做遮挡判断
+      - 验证: 检查被遮挡的锥筒不出现在点云中
+
+  □ 3.4 添加高斯噪声
+      - 表面点加 σ=0.02m 噪声
+      - 验证: 点云有自然散射
+
+Day 4-5: 联调 — 闭环验证
+─────────────────────────
+
+  □ 4.1 编写 mode_a launch 文件
+      - simulator_mode_a.launch.py
+      - 仿真器节点 + FSD 管线节点
+      - 正确的启动顺序
+
+  □ 4.2 感知链路验证
+      - 启动: 仿真器 + lidar_detection_node
+      - 检查: /perception/lidar/cones 是否有检测结果
+      - 检查: 检测到的锥筒数与 YAML 中的可见锥筒数是否接近
+
+  □ 4.3 建图链路验证
+      - 启动: + cone_map_builder
+      - 检查: /mapping/cone_map 是否包含锥筒
+      - 检查: /mapping/cone_map_viz 在 RViz2 中是否正确显示
+
+  □ 4.4 规划链路验证
+      - 启动: + boundary_detector + path_generator
+      - 检查: /planning/centerline 是否有路径点
+      - 检查: /planning/final_waypoints 是否包含完整的参考路径
+
+  □ 4.5 控制链路验证
+      - 启动: + controller_node
+      - 检查: /control/command.speed > 0（车辆在移动）
+      - 检查: /control/target_viz 显示当前目标点和前视圈
+
+  □ 4.6 闭环验证
+      - 观察车辆是否沿赛道稳定行驶
+      - 检查: /sim/ground_truth 轨迹是否在赛道内
+      - 调整参数: ld_ratio, min_lookahead, max_lookahead, 目标速度
+
+  第一期完成标志:
+  ✅ 车辆能从起点出发，沿参考路径稳定行驶，不偏离赛道
+
+──────────────────────────────────────────────────────────────────────────────
+
+三、第二期：模式B — 全仿真 + 定位验证
+──────────────────────────────────────────────────────────────────────────────
+
+目标: 加上 KISS-ICP + EKF 完整定位链，验证全链路。
+
+Day 6: 接入 KISS-ICP
+─────────────────────
+
+  □ 6.1 确认 KISS-ICP submodule 可用
+      - git submodule update --init
+      - 确认 kiss-icp 包已编译
+
+  □ 6.2 编写 mode_b launch 文件
+      - simulator_mode_b.launch.py
+      - 启动 kiss_icp_node, ekf_node, localization_manager
+      - vehicle_model 停止直发 /localization/pose
+
+  □ 6.3 验证 KISS-ICP 里程计
+      - 检查: /kiss/odometry 是否发布
+      - 在 RViz2 中对比 /sim/ground_truth 和 /kiss/odometry
+      - 观察漂移量
+
+  □ 6.4 验证 EKF 融合
+      - 检查: /odometry/filtered 是否发布
+      - 检查: EKF 输出的位姿是否比纯 KISS-ICP 更接近 GT
+
+  □ 6.5 联调全链路
+      - 检查: 每个环节的延迟和数据一致性
+      - 调整 EKF 噪声参数使融合效果最佳
+      - 调整 KISS-ICP 参数适应仿真点云
+
+  第二期完成标志:
+  ✅ 全链路运行，KISS-ICP+EKF 定位误差 < 0.5m
+
+──────────────────────────────────────────────────────────────────────────────
+
+四、第三期：多赛道 + 指标统计
+──────────────────────────────────────────────────────────────────────────────
+
+Day 7-8: 赛道完善 + 可视化
+───────────────────────────
+
+  □ 7.1 完善 3 个标准赛道 YAML
+      - trackdrive: 确保锥筒间距、弯道设计符合 FSG 规则
+      - skidpad: 验证圆半径和锥筒位置
+      - acceleration: 验证长度和终点标记
+
+  □ 7.2 实现 TrackVisualizer
+      - 编写 visualization.py
+      - 发布 /sim/track_viz (MarkerArray)
+      - 发布 /sim/vehicle_path (Path)
+
+  □ 7.3 RViz2 配置文件
+      - 创建 config/simulator.rviz
+      - 预加载所有可视化话题
+      - Fixed Frame: map
+
+Day 9: 指标统计
+────────────────
+
+  □ 8.1 实现 MetricsCollector
+      - 统计以下指标:
+
+      ┌─────────────────────┬──────────────────────────────────┐
+      │ 指标                 │ 说明                             │
+      ├─────────────────────┼──────────────────────────────────┤
+      │ lap_time             │ 跑完一圈用时 (s)                  │
+      │ avg_speed            │ 平均速度 (m/s)                   │
+      │ max_speed            │ 最高速度 (m/s)                   │
+      │ path_deviation_mean  │ 路径平均偏差 (m)                 │
+      │ path_deviation_max   │ 路径最大偏差 (m)                 │
+      │ steering_oscillation │ 转向角振荡次数 (次/圈)            │
+      │ cone_collisions      │ 撞锥筒次数                       │
+      │ loop_closed          │ 是否完成闭环                     │
+      │ total_distance       │ 总行驶距离 (m)                   │
+      └─────────────────────┴──────────────────────────────────┘
+
+  □ 8.2 碰撞检测
+      - 每帧检查车辆边界框是否与锥筒重叠
+      - 碰撞半径: 0.3m（车辆宽度的一半）
+      - 记录碰撞位置和时间
+
+  □ 8.3 路径偏差计算
+      - 计算车辆实际位置到参考路径最近点的距离
+      - 记录每帧偏差
+
+  □ 8.4 结果输出
+      - 仿真结束时打印指标摘要
+      - 可选: 保存为 JSON 文件供后续分析
+
+  第三期完成标志:
+  ✅ 3 个赛道均可运行，能生成指标报告
+
+──────────────────────────────────────────────────────────────────────────────
+
+五、依赖关系图
+──────────────────────────────────────────────────────────────────────────────
+
+  第一期:
+    TrackLoader ──────→ 被 lidar_simulator 和 vehicle_model 依赖
+    VehicleModel ─────→ 被 ins_simulator, can_simulator 读取状态
+    LidarSimulator ───→ 需要 TrackLoader 的锥筒列表 + VehicleModel 的位姿
+    InsSimulator ─────→ 需要 VehicleModel 的位姿
+    CanSimulator ─────→ 需要 VehicleModel 的速度
+    ↓
+    联调 → FSD 管线
+
+  第二期:
+    第一期完成 → 调整 launch 文件 → 启动 kiss_icp + ekf
+    → 验证定位精度 → 联调全链路
+
+  第三期:
+    第二期完成 → 完善赛道 YAML → 可视化 → 指标统计
+
+──────────────────────────────────────────────────────────────────────────────
+
+六、风险与缓解
+──────────────────────────────────────────────────────────────────────────────
+
+| 风险                          | 概率 | 影响 | 缓解措施                        |
+|-------------------------------|------|------|---------------------------------|
+| KISS-ICP 在仿真点云上不收敛    | 中   | 中   | 增加地面点密度，调大 voxel_size |
+| lidar_detection 检测不到锥筒   | 低   | 高   | 增加锥筒表面点数，增大反射面积   |
+| Pure Pursuit 偏离参考路径      | 中   | 中   | 调整 ld_ratio，减小目标速度      |
+| ConeMapBuilder 闭环检测失败    | 低   | 低   | 模式A 不依赖闭环，不影响验证     |
+| Python 性能不够                | 低   | 低   | 10Hz × 几百点，远超 Python 能力  |
+
+──────────────────────────────────────────────────────────────────────────────
+
+七、快速开始（最小可行验证）
+──────────────────────────────────────────────────────────────────────────────
+
+  最快的验证路径（30 分钟内）:
+
+  1. 创建 tracks/test_straight.yaml（10个锥筒的直线赛道）
+  2. 实现 VehicleModel（仅发布 /localization/pose 和 /sim/ground_truth）
+  3. 实现 CanSimulator（发布 /localization/velocity）
+  4. 启动 mission_manager + path_generator + controller_node
+  5. path_generator 用 acceleration 模式生成直线路径（不需要感知+建图）
+  6. 观察车辆是否能沿直线加速
+
+  这验证了最基本的 "控制指令 → 车辆运动 → 定位 → 控制" 闭环。
+
+──────────────────────────────────────────────────────────────────────────────
+
+八、目录结构（最终状态）
+──────────────────────────────────────────────────────────────────────────────
+
+ros2_ws/src/simulation/wuta_simulator/
+├── package.xml
+├── setup.py
+├── setup.cfg
+├── README.md
+├── config/
+│   ├── simulator.yaml               # 主配置文件
+│   └── simulator.rviz               # RViz2 预设
+├── launch/
+│   ├── simulator_mode_a.launch.py   # 模式A: 跳过定位
+│   ├── simulator_mode_b.launch.py   # 模式B: 全仿真
+│   └── test_straight.launch.py      # 快速测试（直线加速）
+├── wuta_simulator/
+│   ├── __init__.py
+│   ├── track_loader.py              # 赛道加载器
+│   ├── vehicle_model.py             # 车辆运动学模型
+│   ├── lidar_simulator.py           # LiDAR 点云模拟
+│   ├── ins_simulator.py             # CG-410 INS 模拟
+│   ├── can_simulator.py             # CAN 车速模拟
+│   ├── visualization.py             # 赛道和轨迹可视化
+│   └── metrics.py                   # 指标统计（第三期）
+├── tracks/
+│   ├── trackdrive.yaml              # 赛道追逐
+│   ├── skidpad.yaml                 # 八字绕桩
+│   ├── acceleration.yaml            # 直线加速
+│   └── test_straight.yaml           # 测试用直线
+└── test/
+    ├── test_track_loader.py
+    ├── test_vehicle_model.py
+    └── test_lidar_simulator.py
+
+================================================================================
+  全文结束 — 共 7 个文档文件
+================================================================================

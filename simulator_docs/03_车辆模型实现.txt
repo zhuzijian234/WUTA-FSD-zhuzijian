@@ -1,0 +1,329 @@
+================================================================================
+  WUTA-FSD 模拟器 — 车辆运动学模型 (vehicle_model.py)
+================================================================================
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+vehicle_model 是仿真器的核心节点，负责：
+
+  1. 订阅 /control/command，接收控制器输出的速度+转角指令
+  2. 使用自行车运动学模型计算新的车辆位姿 (50Hz)
+  3. 发布 ground truth 到多个话题 /localization/pose (模式A), /sim/ground_truth
+  4. 为 lidar_simulator, ins_simulator, can_simulator 提供当前位姿
+
+二、运动学模型（Kinematic Bicycle Model）
+──────────────────────────────────────────────────────────────────────────────
+
+2.1 数学模型
+────────────────
+
+  状态变量:
+    x, y       — 车辆后轴中心在 map 坐标系中的位置 (m)
+    yaw         — 车辆航向角 (rad)，绕 Z 轴，右手定则
+    v           — 车辆当前速度 (m/s)
+
+  参数:
+    wheelbase   = 1.53  (m)     — 轴距
+    max_steer   = 25.0  (deg)   — 最大前轮转角
+
+  输入:
+    speed_cmd       — /control/command.speed (m/s)
+    steer_angle_cmd — /control/command.angle (degrees)
+
+  更新方程 (离散化，dt=0.02s):
+    ┌─────────────────────────────────────────────────┐
+    │ steer_rad = clamp(steer_angle_cmd, -25, 25)     │
+    │            * math.pi / 180.0                     │
+    │                                                 │
+    │ beta = atan2(lf * tan(steer_rad), wheelbase)    │ ← [可选] 质心侧偏角
+    │                                                 │
+    │ x   += v * cos(yaw + beta) * dt                │
+    │ y   += v * sin(yaw + beta) * dt                │
+    │ yaw += v * cos(beta) * tan(steer_rad)           │
+    │        / wheelbase * dt                          │
+    │                                                 │
+    │ 简化版 (beta ≈ 0，低速场景):                     │
+    │ x   += v * cos(yaw) * dt                        │
+    │ y   += v * sin(yaw) * dt                        │
+    │ yaw += v * tan(steer_rad) / wheelbase * dt      │
+    └─────────────────────────────────────────────────┘
+
+  注：简化版足以满足 FSAC 仿真（低速 < 15m/s），
+      如果要模拟高速场景，应使用完整版（含质心侧偏角）。
+
+2.2 为什么用后轴中心？
+──────────────────────
+
+  自行车模型中，后轴中心是运动学约束最简单的参考点:
+    - 后轮不可转向 → 后轴速度方向始终沿车身方向
+    - 前轮可转向 → 转向角影响曲率
+
+  Pure Pursuit 的 VehicleState 也是后轴中心，保持一致。
+
+三、伪代码实现
+──────────────────────────────────────────────────────────────────────────────
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from nav_msgs.msg import Odometry
+from autoware_msgs.msg import Command
+from tf2_ros import TransformBroadcaster
+import math
+import numpy as np
+
+
+class VehicleModel(Node):
+
+    def __init__(self):
+        super().__init__('vehicle_model')
+
+        # ──── 参数 ────
+        self.declare_parameter('wheelbase', 1.53)
+        self.declare_parameter('max_steer_deg', 25.0)
+        self.declare_parameter('update_rate_hz', 50.0)
+
+        self.wheelbase = self.get_parameter('wheelbase').value
+        self.max_steer_rad = math.radians(
+            self.get_parameter('max_steer_deg').value)
+        self.dt = 1.0 / self.get_parameter('update_rate_hz').value
+
+        # ──── 初始状态 ────
+        # 从 track_loader 获取 start_pose
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.speed = 0.0
+        self.steer_angle = 0.0  # 最新控制指令
+
+        # ──── 轨迹历史 ────
+        self.path = []  # [(x, y, yaw, t), ...]
+
+        # ──── 订阅 /control/command ────
+        self.cmd_sub = self.create_subscription(
+            Command, '/control/command', self.on_command, 10)
+
+        # ──── 发布者 (模式A) ────
+        self.pose_pub = self.create_publisher(
+            PoseStamped, '/localization/pose', 10)
+        self.gt_pub = self.create_publisher(
+            Odometry, '/sim/ground_truth', 10)
+
+        # ──── 定时器 ────
+        self.timer = self.create_timer(self.dt, self.update)
+
+        self.get_logger().info('VehicleModel ready.')
+
+    def set_start_pose(self, x, y, yaw):
+        """由 launcher 或 track_loader 调用，设置初始位姿"""
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.speed = 0.0
+        self.get_logger().info(
+            f'Start pose set: ({x:.2f}, {y:.2f}, yaw={math.degrees(yaw):.1f}°)')
+
+    def on_command(self, msg: Command):
+        """接收控制器输出的速度和转角命令"""
+        self.speed = msg.speed                # m/s
+        self.steer_angle = msg.angle          # degrees
+
+    def update(self):
+        """核心更新循环，每 dt 秒调用一次 (50Hz)"""
+
+        # ── 1. 转角限幅 ──
+        steer_rad = math.radians(
+            max(-self.max_steer_rad,
+                min(self.max_steer_rad, self.steer_angle))
+        )
+
+        # ── 2. 运动学更新 ──
+        self.x += self.speed * math.cos(self.yaw) * self.dt
+        self.y += self.speed * math.sin(self.yaw) * self.dt
+        self.yaw += (self.speed * math.tan(steer_rad)
+                     / self.wheelbase * self.dt)
+
+        # ── 3. 航向角归一化 ──
+        self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
+
+        # ── 4. 记录轨迹 ──
+        now = self.get_clock().now()
+        self.path.append((self.x, self.y, self.yaw, now))
+
+        # ── 5. 计算 yaw_rate ──
+        yaw_rate = self.speed * math.tan(steer_rad) / self.wheelbase
+
+        # ── 6. 发布 PoseStamped (模式A: 直接驱动FSD) ──
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = now.to_msg()
+        pose_msg.header.frame_id = 'map'
+        pose_msg.pose.position.x = self.x
+        pose_msg.pose.position.y = self.y
+        pose_msg.pose.position.z = 0.0
+        # yaw → quaternion
+        pose_msg.pose.orientation.z = math.sin(self.yaw * 0.5)
+        pose_msg.pose.orientation.w = math.cos(self.yaw * 0.5)
+        self.pose_pub.publish(pose_msg)
+
+        # ── 7. 发布 GroundTruth Odometry ──
+        gt_msg = Odometry()
+        gt_msg.header.stamp = now.to_msg()
+        gt_msg.header.frame_id = 'map'
+        gt_msg.child_frame_id = 'base_link'
+        gt_msg.pose.pose = pose_msg.pose
+        gt_msg.twist.twist.linear.x = self.speed
+        gt_msg.twist.twist.angular.z = yaw_rate
+        # 协方差设为 0（完美测量）
+        self.gt_pub.publish(gt_msg)
+
+        # ── 8. 广播 TF ──
+        # self.broadcast_tf()  # 如有需要
+
+    @property
+    def state(self):
+        """返回当前状态，供其他模拟器模块读取"""
+        return {
+            'x': self.x,
+            'y': self.y,
+            'yaw': self.yaw,
+            'speed': self.speed,
+            'steer_angle': self.steer_angle,
+        }
+
+四、关键实现细节
+──────────────────────────────────────────────────────────────────────────────
+
+4.1 初始位姿严格对齐
+────────────────────
+
+  vehicle_model 的 start_pose 必须与 track.yaml 中的 start_pose 完全一致。
+  实现方式:
+
+    方案1: launch 文件传递参数
+      vehicle_model_node = Node(
+          package='wuta_simulator',
+          executable='vehicle_model',
+          parameters=[{
+              'start_x': 0.0,
+              'start_y': 0.0,
+              'start_yaw': 0.0,
+          }]
+      )
+
+    方案2: track_loader 通过 ROS2 参数设置
+      # track_loader 读取 YAML 后:
+      self.declare_parameter('start_x', 0.0)
+      ...
+
+    方案3: 服务调用
+      # track_loader 通过 set_pose 服务通知 vehicle_model
+
+  推荐方案2，简单且不引入额外通信开销。
+
+4.2 与 controller 的 VehicleParams 保持一致
+─────────────────────────────────────────────────
+
+  仿真器 wheelbase   = 1.53  ←→  controller/vehicle_state.hpp: wheel_base{1.53}
+  仿真器 max_steer   = 25.0  ←→  controller/vehicle_state.hpp: max_steer_angle{25.0}
+
+  两个值必须一致，否则控制器的计算与仿真器实际行为不匹配。
+
+4.3 静止时无偏航角变化
+──────────────────────
+
+  当 speed ≈ 0 时:
+    yaw_rate = 0 * tan(steer) / wheelbase = 0
+
+  所以车辆静止时打方向盘不会改变航向，符合实际情况。
+
+4.4 航向角归一化
+────────────────
+
+  每次更新后必须归一化:
+    self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
+
+  防止 yaw 值无限增长导致浮点精度问题。
+
+4.5 RViz2 可视化
+────────────────
+
+  除发布话题外，可通过 TF 广播器发布 map→base_link 变换，
+  让 RViz2 显示车辆模型:
+
+    from tf2_ros import TransformBroadcaster
+    from geometry_msgs.msg import TransformStamped
+
+    def broadcast_tf(self):
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'base_link'
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+        t.transform.rotation.z = math.sin(self.yaw * 0.5)
+        t.transform.rotation.w = math.cos(self.yaw * 0.5)
+        self.tf_broadcaster.sendTransform(t)
+
+五、车辆模型单元测试
+──────────────────────────────────────────────────────────────────────────────
+
+测试1: 直线行驶
+────────────────
+  输入: speed=5.0, steer=0.0, dt=0.02, 持续1秒
+  期望: x=5.0, y=0.0, yaw=0.0
+
+  def test_straight_line():
+      model = VehicleModel()
+      model.set_start_pose(0, 0, 0)
+      model.speed = 5.0
+      model.steer_angle = 0.0
+      for _ in range(50):  # 1s @ 50Hz
+          model.update()
+      assert abs(model.x - 5.0) < 0.01
+      assert abs(model.y) < 0.01
+      assert abs(model.yaw) < 0.001
+
+测试2: 最大转角转弯
+────────────────────
+  输入: speed=3.0, steer=25°, dt=0.02, 持续约0.5秒
+  期望: 车辆左转，yaw 增加
+
+  def test_max_steer():
+      model = VehicleModel()
+      model.set_start_pose(0, 0, 0)
+      model.speed = 3.0
+      model.steer_angle = 25.0
+      for _ in range(25):  # 0.5s
+          model.update()
+      assert model.yaw > 0.1  # 应明显左转
+
+测试3: 静止打方向盘
+────────────────────
+  输入: speed=0.0, steer=25°, dt=0.02
+  期望: 位姿不变
+
+  def test_stationary_steer():
+      model = VehicleModel()
+      model.set_start_pose(0, 0, 0)
+      model.speed = 0.0
+      model.steer_angle = 25.0
+      for _ in range(10):
+          model.update()
+      assert model.x == 0.0
+      assert model.y == 0.0
+      assert model.yaw == 0.0
+
+测试4: 极限转角限幅
+────────────────────
+  输入: speed=3.0, steer=40°（超过25°限幅）
+  期望: 实际转角被限制在25°
+
+  def test_steer_clamp():
+      # 行为应等价于 steer=25°
+      ...
+
+================================================================================
+  下一步: 请阅读 04_LiDAR模拟器实现.txt
+================================================================================

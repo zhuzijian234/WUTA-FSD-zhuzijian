@@ -1,0 +1,340 @@
+================================================================================
+  WUTA-FSD 模拟器 — 话题拓扑与数据流详解
+================================================================================
+
+一、完整话题拓扑图
+──────────────────────────────────────────────────────────────────────────────
+
+                        ★ 仿真器发布的话题 ★
+                        ═══════════════════════
+
+                         ┌──────────────────┐
+                         │  vehicle_model   │
+                         │  (50Hz, 核心)     │
+                         └──┬───────┬───────┘
+                            │       │
+              ┌─────────────┘       └─────────────┐
+              ▼                                   ▼
+  ┌─────────────────────┐             ┌─────────────────────┐
+  │ /sim/ground_truth   │             │ /localization/pose  │ ← 模式A
+  │ (Odometry)          │             │ (PoseStamped)       │
+  │ [可视化对比用]       │             │ [驱动FSD管线]        │
+  └─────────────────────┘             └──────────┬──────────┘
+                                                 │
+              ┌──────────────────────────────────┤
+              │                                  │
+  ┌───────────┴───────────┐        ┌────────────┴──────────┐
+  │  can_simulator        │        │  ins_simulator         │
+  │  (50Hz)               │        │  (20Hz)                │
+  │                       │        │                        │
+  │  读取车辆真实速度      │        │  读取车辆真实位姿       │
+  │  + 零均值高斯噪声      │        │  + 零均值高斯噪声       │
+  │  (σ=0.1 m/s)          │        │  (位置σ=0.05m,         │
+  └───────────┬───────────┘        │   航向σ=0.5°)          │
+              │                    └────────────┬───────────┘
+              ▼                                 ▼
+  ┌─────────────────────┐        ┌─────────────────────┐
+  │ /localization/       │        │ /cg410/odometry     │
+  │   velocity           │        │ (Odometry)          │
+  │ (TwistStamped)       │        │                     │
+  │                      │        │ 消费者: ekf_node     │
+  │ 消费者:               │        │ (模式B)              │
+  │ controller_node      │        └──────────┬──────────┘
+  └──────────┬───────────┘                   │
+             │                               │
+             │           ┌───────────────────┘
+             │           │
+             ▼           ▼
+  ┌─────────────────────────────────────────────────┐
+  │              lidar_simulator (10Hz)              │
+  │                                                  │
+  │  输入: vehicle_model GT pose                     │
+  │       track_loader 的所有锥筒坐标                 │
+  │                                                  │
+  │  处理: 射线投射 → 可见锥筒 → 表面点+地面点       │
+  │                                                  │
+  │  输出: /hesai/pandar (PointCloud2)                │
+  └──────────────────────┬──────────────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │ /hesai/pandar       │
+              │ (PointCloud2)       │
+              │                     │
+              │ 消费者:              │
+              │ kiss_icp_node       │
+              │ lidar_detection_node│
+              │ ndt_localization    │
+              └─────────────────────┘
+
+
+                   ★ FSD 管线内部话题 ★
+                   ═══════════════════
+
+  /hesai/pandar (PointCloud2)
+       │
+       ├──→ kiss_icp_node ──→ /kiss/odometry ──→ ekf_node
+       │                                              │
+       ├──→ ndt_localization ──→ /ndt/pose ──────────┤
+       │                                              │
+       │                    /cg410/odometry ──────────┤
+       │                                              ▼
+       │                              /odometry/filtered (Odometry)
+       │                                         │
+       │                                         ▼
+       │                              localization_manager
+       │                                         │
+       └──→ lidar_detection_node                 │
+                │                                │
+                ▼                                │
+         /perception/lidar/cones (ConeArray)     │
+                │                                │
+                ▼                                │
+         cone_map_builder                        │
+                │                                │
+                ▼                                │
+         /mapping/cone_map (ConeMap)             │
+                │                                │
+                ▼                                │
+         boundary_detector                       │
+                │                                │
+                ▼                                │
+         /planning/centerline (Lane)             │
+                │                                │
+                ▼                                │
+         path_generator                          │
+                │                                │
+                ▼                                │
+         /planning/final_waypoints (Lane)        │
+                │                                │
+                ├────────────────────────────────┘
+                │
+         ┌──────┴──────┐
+         │              │
+         ▼              ▼
+  /localization/  /localization/
+  pose            velocity
+         │              │
+         └──────┬───────┘
+                │
+                ▼
+         controller_node
+                │
+                ▼
+         /control/command (Command)
+                │
+                └────→ vehicle_model.update()  ★ 闭环 ★
+
+
+                ★ 仿真器可视化话题 ★
+                ═══════════════════
+
+  /sim/ground_truth   (Odometry,    50Hz) → RViz2 显示真实位姿
+  /sim/track_viz      (MarkerArray, 1Hz)  → RViz2 显示赛道锥筒
+  /sim/vehicle_path   (Path,        1Hz)  → RViz2 显示行驶轨迹
+
+
+二、话题详细规格
+──────────────────────────────────────────────────────────────────────────────
+
+2.1 仿真器发布的话题（3个边界话题 + 3个可视化话题）
+──────────────────────────────────────────────────
+
+话题 1: /hesai/pandar
+  消息类型: sensor_msgs/msg/PointCloud2
+  频率:     10Hz
+  帧ID:     "hesai" (传感器坐标系)
+  发布者:   lidar_simulator
+  消费者:   kiss_icp_node, lidar_detection_node, ndt_localization_node
+  内容:
+    - 200-500 个地面点 (z ≈ -1.0 ~ -0.8m)
+    - 每个可见锥筒 12-16 个表面反射点 (加 σ=0.02m 高斯噪声)
+    - 点的 intensity 字段为 0（模拟器不做强度）
+  消息构造注意:
+    - header.frame_id = "hesai"（需要与 kiss_icp_hesai128.yaml 配置一致）
+    - header.stamp = self.get_clock().now().to_msg()
+    - 使用 sensor_msgs.point_cloud2.create_cloud_xyz32() 创建
+
+话题 2: /cg410/odometry
+  消息类型: nav_msgs/msg/Odometry
+  频率:     20Hz
+  帧ID:     "odom" (header), "base_link" (child_frame_id)
+  发布者:   ins_simulator
+  消费者:   ekf_node (robot_localization)
+  内容:
+    pose.pose.position:     GT pose + N(0, 0.05²) 噪声
+    pose.pose.orientation:  GT yaw → quaternion + N(0, 0.5°²) 噪声
+    twist.twist.linear.x:  GT speed + N(0, 0.1²) 噪声
+    twist.twist.linear.y, .z:  0.0
+    twist.twist.angular.z: GT yaw_rate + N(0, 0.02²) 噪声
+  噪声参数可调（在 simulator.yaml 中配置）
+
+话题 3: /localization/velocity
+  消息类型: geometry_msgs/msg/TwistStamped
+  频率:     50Hz
+  帧ID:     "base_link"
+  发布者:   can_simulator
+  消费者:   controller_node
+  内容:
+    twist.linear.x:  GT speed
+    twist.linear.y, .z:  0.0
+    twist.angular.z:  GT yaw_rate (speed * tan(steer) / wheelbase)
+  说明:
+    模拟的是 CAN 总线上轮速传感器的输出。
+    真车上，轮速传感器 → CAN → can_msgs/Frame → CAN驱动 → TwistStamped。
+    仿真器中跳过 CAN 协议，直接发布 TwistStamped。
+
+话题 4: /localization/pose  (仅模式A)
+  消息类型: geometry_msgs/msg/PoseStamped
+  频率:     50Hz
+  帧ID:     "map"
+  发布者:   vehicle_model (模式A专有)
+  消费者:   controller_node, cone_map_builder, boundary_detector
+  内容:
+    pose.position:    GT x, y, z
+    pose.orientation: GT yaw → quaternion
+  说明:
+    模式A 跳过 KISS-ICP+EKF，直接用 GT 驱动 FSD 管线。
+    模式B 中此话题由 localization_manager 发布。
+
+话题 5: /sim/ground_truth
+  消息类型: nav_msgs/msg/Odometry
+  频率:     50Hz
+  帧ID:     "map" (header), "base_link" (child_frame_id)
+  发布者:   vehicle_model
+  内容:     无噪声的真实位姿和速度
+  说明:     用于 RViz2 中对比定位估计值与真实值
+
+话题 6: /sim/track_viz
+  消息类型: visualization_msgs/msg/MarkerArray
+  频率:     1Hz (静态场景，低频即可)
+  帧ID:     "map"
+  发布者:   visualization 节点
+  内容:
+    - 蓝色圆柱体 → blue_cones
+    - 黄色圆柱体 → yellow_cones
+    - 橙色圆柱体 → orange_cones
+    - 白色圆柱体 → unknown_cones
+  说明:     与 /mapping/cone_map_viz 对比，观察建图偏差
+
+2.2 FSD 管线内部话题（全部不变）
+──────────────────────────────────
+
+| 话题                       | 类型           | 发布者               | 消费者               |
+|----------------------------|----------------|----------------------|----------------------|
+| /kiss/odometry             | Odometry       | kiss_icp_node        | ekf_node             |
+| /odometry/filtered         | Odometry       | ekf_node             | localization_manager |
+| /ndt/pose                  | PoseStamped    | ndt_localization     | localization_manager |
+| /ndt/path                  | Path           | ndt_localization     | RViz2                |
+| /ndt/map_ready             | Bool           | map_saver            | mission_manager      |
+| /perception/lidar/cones    | ConeArray      | lidar_detection_node | cone_map_builder     |
+| /perception/lidar/cones_viz| MarkerArray    | lidar_detection_node | RViz2                |
+| /mapping/cone_map          | ConeMap        | cone_map_builder     | boundary_detector    |
+| /mapping/cone_map_viz      | MarkerArray    | cone_map_builder     | RViz2                |
+| /planning/centerline       | Lane           | boundary_detector    | path_generator       |
+| /planning/centerline_viz   | MarkerArray    | boundary_detector    | RViz2                |
+| /planning/final_waypoints  | Lane           | path_generator       | controller_node      |
+| /control/command           | Command        | controller_node      | vehicle_model(仿真)  |
+| /control/target_viz        | MarkerArray    | controller_node      | RViz2                |
+| /system/mission_state      | MissionState   | mission_manager      | 所有节点              |
+
+三、时序关系
+──────────────────────────────────────────────────────────────────────────────
+
+仿真器启动顺序（严格遵守）:
+─────────────────────────────
+
+  时间 T0:
+    mission_manager_node 启动
+    发布 /system/mission_state (state=READY, mission_mode=trackdrive)
+
+  时间 T0 + 1s:
+    仿真器所有节点启动完毕:
+      - track_loader 加载 YAML
+      - vehicle_model 初始化（停在 start_pose）
+      - lidar_simulator, ins_simulator, can_simulator 就绪
+
+  时间 T0 + 1.5s:
+    lidar_detection_node 收到第一帧点云并开始检测
+
+  时间 T0 + 2s:
+    向 /system/mission_mode_cmd 发布 "trackdrive"
+    或通过 launch 参数 mission_mode:=trackdrive
+    → mission_manager 进入 EXPLORE 状态
+    → controller_node 启用 (enabled_ = true)
+    → 闭环开始
+
+频率关系:
+  vehicle_model:    50Hz ──── 最高频，驱动整个仿真
+  can_simulator:    50Hz ──── 同频
+  ins_simulator:    20Hz ──── 中频
+  lidar_simulator:  10Hz ──── 最低频
+  controller_node:  50Hz ──── 控制循环
+  cone_map_builder:  5Hz ──── 地图发布
+
+  每 20ms (50Hz):
+    vehicle_model.update() → 更新位姿
+    can_simulator 发布 /localization/velocity
+    controller_node.controlLoop() 执行
+
+  每 50ms (20Hz):
+    ins_simulator 发布 /cg410/odometry
+
+  每 100ms (10Hz):
+    lidar_simulator 发布 /hesai/pandar
+    lidar_detection_node.onPointCloud() 触发
+
+四、模式A vs 模式B 话题差异
+──────────────────────────────────────────────────────────────────────────────
+
+                    模式A (跳过定位)         模式B (全仿真)
+                    ════════════════         ════════════
+
+  /localization/pose    ← vehicle_model     ← localization_manager
+                        (GT 直发)              (EKF/NDT 输出)
+
+  /hesai/pandar         ← lidar_simulator   ← lidar_simulator
+                                              → kiss_icp_node  ← 新增消费者
+                                              → ndt_localization ← 新增消费者
+
+  /cg410/odometry       ← ins_simulator     ← ins_simulator
+                                              → ekf_node        ← 新增消费者
+
+  启动节点:
+  仿真器:   4 节点      仿真器:   4 节点
+  FSD管线:  5 节点      FSD管线:  8 节点
+  (不含定位)             (含完整定位链)
+
+  优势:
+  快速验证规划控制      完整验证全链路
+  绕开SLAM收敛问题      测试定位参数
+
+五、数据一致性检查点
+──────────────────────────────────────────────────────────────────────────────
+
+在开发过程中，建议在以下关键点检查数据一致性:
+
+  1. vehicle_model 位姿应与 track.yaml 的 start_pose 一致
+     → 检查: 第一帧 /sim/ground_truth == start_pose
+
+  2. lidar_simulator 的点云应包含锥筒表面点
+     → 检查: /hesai/pandar 的 width 和 height
+
+  3. lidar_detection 检测的锥筒数应与可见锥筒数接近
+     → 检查: /perception/lidar/cones 的 cones.size()
+
+  4. cone_map_builder 的地图应包含 YAML 中的全部锥筒
+     → 检查: /mapping/cone_map 的 blue/yellow_cones.size()
+
+  5. boundary_detector 应输出至少 2 个路径点
+     → 检查: /planning/centerline.waypoints.size()
+
+  6. controller 应输出有效的控制指令
+     → 检查: /control/command.speed > 0 且 abs(angle) < max_steer
+
+  7. 车辆应在赛道上行驶（不偏离太远）
+     → 检查: /sim/ground_truth 的轨迹
+
+================================================================================
+  下一步: 请阅读 03_车辆模型实现.txt
+================================================================================

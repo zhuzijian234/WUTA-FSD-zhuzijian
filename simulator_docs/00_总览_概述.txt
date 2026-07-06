@@ -1,0 +1,327 @@
+================================================================================
+  WUTA-FSD 轻量级仿真器开发文档 — 总览
+  版本: v1.0
+  目标: 不依赖任何硬件，闭环验证完整 FSD 算法链路
+================================================================================
+
+一、设计哲学
+──────────────────────────────────────────────────────────────────────────────
+
+核心理念：只替换传感器输入层，现有 FSD 管线代码一行不改
+
+  仿真器                            现有 FSD 管线
+┌─────────────────────┐       ┌─────────────────────────────┐
+│                     │       │                             │
+│  Track Loader       │       │  lidar_detection ──┐        │
+│  (cone_map.yaml)    │       │       │            │        │
+│       │             │       │       ▼            │        │
+│       ▼             │       │  cone_map_builder  │        │
+│  LiDAR Sim  ────────┼──→ /hesai/pandar           │        │
+│  (射线投射)          │       │       │            │        │
+│       │             │       │       ▼            │        │
+│       ▼             │       │  boundary_detector │        │
+│  Vehicle Model ←────┼── /control/command         │        │
+│  (自行车模型)        │       │       │            │        │
+│   │   │   │         │       │       ▼            │        │
+│   │   │   │         │       │  path_generator    │        │
+│   │   │   │         │       │       │            │        │
+│   │   │   │         │       │       ▼            │        │
+│   │   │   │         │       │  controller ───────┼── /control/command
+│   │   │   │         │       │                    │        │
+└───┼───┼───┼─────────┘       └────────────────────┴────────┘
+    │   │   │
+    │   │   └── /localization/velocity (TwistStamped)
+    │   │       消费者: controller_node
+    │   │
+    │   └────── /cg410/odometry (Odometry)
+    │           消费者: ekf_node
+    │
+    └────────── /hesai/pandar (PointCloud2)
+                消费者: kiss_icp_node
+                        lidar_detection_node
+                        ndt_localization_node
+
+二、闭环流程
+──────────────────────────────────────────────────────────────────────────────
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  仿真器发布传感器数据                                     │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  FSD 管线处理（感知→建图→规划→控制）                      │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  输出 /control/command (speed + steering_angle)          │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  仿真器用控制指令更新车辆位置（自行车模型）                  │
+  │       │                                                 │
+  │       ▼                                                 │
+  │  基于新位置生成新传感器数据 → 回到第一步                    │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+
+三、包结构
+──────────────────────────────────────────────────────────────────────────────
+
+新建 1 个纯 Python 包，放在 ros2_ws/src/simulation/wuta_simulator/
+
+src/simulation/wuta_simulator/
+├── package.xml                      # ROS2 包清单
+├── setup.py                         # Python 包安装脚本
+├── setup.cfg                        # 安装配置
+├── config/
+│   └── simulator.yaml               # 仿真器参数配置
+├── launch/
+│   ├── simulator_mode_a.launch.py   # 模式A: 跳过定位，GT直发/localization/pose
+│   └── simulator_mode_b.launch.py   # 模式B: 全仿真，KISS-ICP+EKF
+├── wuta_simulator/
+│   ├── __init__.py
+│   ├── track_loader.py              # 赛道YAML加载器
+│   ├── vehicle_model.py             # 自行车运动学模型 + GT发布
+│   ├── lidar_simulator.py           # 射线投射模拟LiDAR点云
+│   ├── ins_simulator.py             # 模拟CG-410 INS
+│   ├── can_simulator.py             # 模拟CAN车速上报
+│   └── visualization.py             # 赛道和GT可视化(RViz2)
+└── tracks/
+    ├── trackdrive.yaml              # 赛道追逐赛道
+    ├── skidpad.yaml                 # 八字绕桩赛道
+    └── acceleration.yaml            # 直线加速赛道
+
+四、两种运行模式
+──────────────────────────────────────────────────────────────────────────────
+
+模式 A：跳过定位（第一期开发目标）
+───────────────────────────────
+
+  不启动 KISS-ICP + EKF，直接把 ground truth 位姿发到 /localization/pose
+
+  适合场景：
+  - 快速验证规划控制链路是否正常
+  - 绕开 KISS-ICP 可能不收敛的问题
+  - 调试 controller 参数
+
+  节点启动清单:
+  ┌─────────────────────────────────────────────────────┐
+  │ 仿真器节点:                                          │
+  │   - vehicle_model (50Hz)                            │
+  │   - lidar_simulator (10Hz)                          │
+  │   - ins_simulator (20Hz)                            │
+  │   - can_simulator (50Hz)                            │
+  │   - track_viz (1Hz)                                 │
+  │                                                     │
+  │ FSD管线节点:                                         │
+  │   - lidar_detection_node                            │
+  │   - cone_map_builder                                │
+  │   - boundary_detector_node                          │
+  │   - path_generator_node                             │
+  │   - controller_node                                 │
+  │   - mission_manager_node                            │
+  │                                                     │
+  │ ❌ 不启动: kiss_icp_node, ekf_node                   │
+  │ ✅ vehicle_model 直接发 /localization/pose           │
+  └─────────────────────────────────────────────────────┘
+
+  关键设计：
+  vehicle_model 除发布 GT 到 /sim/ground_truth 外，
+  额外发布到 /localization/pose，模拟定位输出。
+  这样 controller_node、cone_map_builder、boundary_detector
+  都能正常工作，完全不需要改代码。
+
+模式 B：全仿真（第二期开发目标）
+─────────────────────────────
+
+  加上 KISS-ICP + EKF 完整定位链
+
+  适合场景：
+  - 完整验证定位→建图→规划→控制全链路
+  - 测试 KISS-ICP 参数
+  - 验证 NDT 地图匹配流程
+
+  节点启动清单:
+  ┌─────────────────────────────────────────────────────┐
+  │ 仿真器节点:                                          │
+  │   - vehicle_model (50Hz)                            │
+  │   - lidar_simulator (10Hz)                          │
+  │   - ins_simulator (20Hz)                            │
+  │   - can_simulator (50Hz)                            │
+  │   - track_viz (1Hz)                                 │
+  │                                                     │
+  │ FSD管线节点:                                         │
+  │   - kiss_icp_node                                   │
+  │   - ekf_node                                        │
+  │   - localization_manager                            │
+  │   - lidar_detection_node                            │
+  │   - cone_map_builder                                │
+  │   - boundary_detector_node                          │
+  │   - path_generator_node                             │
+  │   - controller_node                                 │
+  │   - mission_manager_node                            │
+  │                                                     │
+  │ ✅ 全链路启动                                        │
+  │ ✅ localization_manager 输出 /localization/pose      │
+  └─────────────────────────────────────────────────────┘
+
+五、仿真器发布的 3 个传感器话题（边界）
+──────────────────────────────────────────────────────────────
+
+| 序号 | 话题名               | 消息类型      | 频率   | 消费者                      | 仿真器模块       |
+|------|----------------------|---------------|--------|-----------------------------|------------------|
+|  1   | /hesai/pandar        | PointCloud2   | 10Hz   | kiss_icp_node               | lidar_simulator  |
+|      |                      |               |        | lidar_detection_node        |                  |
+|      |                      |               |        | ndt_localization_node       |                  |
+|  2   | /cg410/odometry      | Odometry      | 20Hz   | ekf_node                    | ins_simulator    |
+|  3   | /localization/velocity| TwistStamped  | 50Hz   | controller_node             | can_simulator    |
+
+只要这 3 个话题正确发布，整条 FSD 管线无需任何代码改动即可运行。
+
+六、仿真器额外发布的可视化话题
+──────────────────────────────────────────────────────────────
+
+| 话题名                | 消息类型    | 频率  | 说明                          |
+|-----------------------|-------------|-------|-------------------------------|
+| /sim/ground_truth     | Odometry    | 50Hz  | 真实位姿，与定位估计对比        |
+| /sim/track_viz        | MarkerArray | 1Hz   | 真实锥筒位置，与建图结果对比    |
+| /sim/vehicle_path     | Path        | 1Hz   | 车辆行驶轨迹                   |
+
+七、数据流详解
+──────────────────────────────────────────────────────────────
+
+模式A 数据流:
+─────────────────
+
+  trackdrive.yaml
+       │
+       ▼
+  TrackLoader.load()
+       │  返回: blue_cones[], yellow_cones[], orange_cones[], start_pose
+       ▼
+  VehicleModel.reset(start_pose)
+       │  初始状态: x, y, yaw = start_pose
+       │
+       ▼  ← /control/command 每 20ms 到达
+  VehicleModel.update(speed, angle, dt=0.02)
+       │  计算新位姿:
+       │    x += speed * cos(yaw) * dt
+       │    y += speed * sin(yaw) * dt
+       │    yaw += speed * tan(steer_rad) / wheelbase * dt
+       │
+       ├──→ publish /localization/pose (PoseStamped, 50Hz)
+       │       供: controller, cone_map_builder, boundary_detector
+       │
+       ├──→ publish /sim/ground_truth (Odometry, 50Hz)
+       │       供: RViz2 可视化对比
+       │
+       ├──→ publish /sim/vehicle_path (Path, 1Hz)
+       │       供: 轨迹回放
+       │
+       ├──→ 供给 can_simulator
+       │       publish /localization/velocity (TwistStamped, 50Hz)
+       │
+       ├──→ 供给 ins_simulator
+       │       publish /cg410/odometry (Odometry, 20Hz)
+       │
+       └──→ 供给 lidar_simulator
+              ┌─────────────────────────────────────┐
+              │ 对于每个锥筒:                         │
+              │  1. 变换到车辆坐标系                   │
+              │  2. 检查是否在 FOV 内 (±60°)           │
+              │  3. 检查是否在距离范围内 (1.5~50m)      │
+              │  4. 检查是否被遮挡                      │
+              │  5. 生成 12-16 个表面反射点 + 高斯噪声  │
+              │  6. 生成 200-500 个地面点               │
+              │  7. 组装 PointCloud2 消息               │
+              └─────────────────────────────────────┘
+              publish /hesai/pandar (PointCloud2, 10Hz)
+                     │
+                     ▼
+              lidar_detection_node
+                     │  ConeArray
+                     ▼
+              cone_map_builder
+                     │  ConeMap
+                     ▼
+              boundary_detector
+                     │  Centerline (Lane)
+                     ▼
+              path_generator
+                     │  Final Waypoints (Lane)
+                     ▼
+              controller_node
+                     │  /control/command
+                     │
+                     └────→ 回到 VehicleModel.update()
+                              ★ 闭环完成！★
+
+模式B 数据流:
+─────────────────
+
+  与模式A的区别仅在于定位链:
+
+  /hesai/pandar ──→ kiss_icp_node ──→ /kiss/odometry ──┐
+                                                       │
+  /cg410/odometry ─────────────────────────────────────┤
+                                                       ▼
+                                                  ekf_node
+                                                       │
+                                                       ▼
+                                              /odometry/filtered
+                                                       │
+                                                       ▼
+                                              localization_manager
+                                                       │
+                                                       ▼
+                                              /localization/pose
+                                                       │
+                              ┌────────────────────────┘
+                              │
+                   controller_node, cone_map_builder,
+                   boundary_detector 均从此获取位姿
+
+  vehicle_model 不再直接发布到 /localization/pose
+  而是只发布 /sim/ground_truth 供可视化对比
+
+八、车辆运动学模型参数
+──────────────────────────────────────────────────────────────
+
+  wheelbase       = 1.53    # 轴距 (m)，与 controller 的 VehicleParams 一致
+  max_steer_deg   = 25.0    # 最大转角 (deg)
+  dt              = 0.02    # 仿真步长 (s) = 50Hz
+
+  状态变量:
+    x, y, yaw     # 平面位姿
+    speed          # 当前车速 (m/s)
+
+  更新方程:
+    steer_rad = clamp(command.angle, -25°, 25°) * π / 180
+    x        += command.speed * cos(yaw) * dt
+    y        += command.speed * sin(yaw) * dt
+    yaw      += command.speed * tan(steer_rad) / wheelbase * dt
+
+  注：这是一个运动学自行车模型 (Kinematic Bicycle Model)，
+      假设无侧滑、低速、平面运动。对于 FSAC 仿真已足够。
+
+九、FSG 标准赛道规格
+──────────────────────────────────────────────────────────────
+
+  Trackdrive (赛道追逐):
+    - 直道 + 弯道组合，全长约 200-400m
+    - 蓝锥筒 (左边界) 和 黄锥筒 (右边界) 间隔 3-5m
+    - 左右锥筒之间宽度 3-5m
+    - 弯道处锥筒间距更密
+
+  Skidpad (八字绕桩):
+    - 两个圆，半径各 9.125m
+    - 圆心距 18.25m
+    - 每圈均匀分布约 18 个锥筒
+    - 先跑右圆 2 圈，再跑左圆 2 圈
+
+  Acceleration (直线加速):
+    - 直线 75m
+    - 两侧锥筒间距 3m
+    - 起始线和终点线有橙色锥筒标记
+
+================================================================================
+  下一步: 请阅读 01_赛道YAML格式规范.txt
+================================================================================

@@ -1,0 +1,362 @@
+================================================================================
+  WUTA-FSD 模拟器 — LiDAR 模拟器 (lidar_simulator.py)
+================================================================================
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+  输入:
+    - vehicle_model.state (GT位姿) — 通过共享内存或 ROS2 参数获取
+    - track_loader 的锥筒全局坐标列表
+
+  输出:
+    - /hesai/pandar (PointCloud2, 10Hz)
+      模拟禾赛 128 线 LiDAR 的一帧点云
+
+  核心算法:
+    对每个锥筒做射线检测 → 判断可见性 → 生成表面点 → 添加地面点
+    → 组装 PointCloud2 消息 → 发布
+
+二、坐标系关系
+──────────────────────────────────────────────────────────────────────────────
+
+  Map 坐标系 (全局):
+    - 所有锥筒的坐标定义在此坐标系
+    - vehicle_model 的 (x, y, yaw) 也在此坐标系
+
+  传感器坐标系 (hesai):
+    - LiDAR 安装在车顶，相对 base_link 的外参:
+      - 平移: (1.0, 0.0, 1.2)  ← LiDAR 在车顶，前移 1m，高 1.2m
+      - 旋转: 无（LiDAR 坐标系与 base_link 对齐）
+    - 发布点云时 frame_id = "hesai"
+
+  变换链: map → base_link → hesai
+
+三、射线投射算法
+──────────────────────────────────────────────────────────────────────────────
+
+3.1 算法流程
+─────────────
+
+  for each cone in (blue_cones + yellow_cones + orange_cones):
+      │
+      ├── Step 1: 将锥筒从 map 坐标系变换到 hesai 坐标系
+      │   cone_hesai = T_hesai_base_link⁻¹ * T_base_link_map * cone_map
+      │   等价于:
+      │   dx = cone.x - (ego.x + LiDAR_offset_x)
+      │   dy = cone.y - (ego.y + LiDAR_offset_y)
+      │   d_local_x =  dx * cos(yaw) + dy * sin(yaw)   # 纵向
+      │   d_local_y = -dx * sin(yaw) + dy * cos(yaw)   # 横向
+      │   d_local_z = cone.z - LiDAR_height
+      │
+      ├── Step 2: 计算极坐标
+      │   distance = sqrt(d_local_x² + d_local_y² + d_local_z²)
+      │   azimuth  = atan2(d_local_y, d_local_x)  # 水平角
+      │   elevation = atan2(d_local_z, sqrt(d_local_x² + d_local_y²))
+      │
+      ├── Step 3: FOV 检查
+      │   if distance < min_range (1.5m):  → 太近，跳过
+      │   if distance > max_range (50m):   → 太远，跳过
+      │   if |azimuth| > FOV_horiz/2 (60°): → 不在水平视场
+      │
+      ├── Step 4: 遮挡检测
+      │   for each closer_cone in sorted_cones_by_distance:
+      │       if angle_between(cone_azimuth, closer_cone_azimuth) < occlusion_threshold:
+      │           if closer_cone_distance < cone_distance:
+      │               cone is occluded → 跳过
+      │
+      └── Step 5: 生成表面反射点
+          num_points = random(12, 16)  # 模拟锥筒表面
+          for i in range(num_points):
+              # 在锥筒中心周围生成带噪声的点
+              point_x = cone_hesai_x + random.gauss(0, sigma_xy)
+              point_y = cone_hesai_y + random.gauss(0, sigma_xy)
+              point_z = cone_hesai_z + random.gauss(0, sigma_z)
+              + random.uniform(-0.1, 0.4)  # 模拟锥筒高度
+              points.append((point_x, point_y, point_z))
+
+3.2 参数说明
+─────────────
+
+  LiDAR 外参（模拟禾赛 128 线安装在车顶）:
+    lidar_x_offset  = 1.0    # LiDAR 相对 base_link 的前向偏移 (m)
+    lidar_y_offset  = 0.0    # LiDAR 相对 base_link 的横向偏移 (m)
+    lidar_z_height  = 1.2    # LiDAR 安装高度 (m)
+
+  检测参数:
+    min_range       = 1.5    # 最小检测距离 (m)
+    max_range       = 50.0   # 最大检测距离 (m)
+    fov_horizontal  = 120.0  # 水平视场角 (degrees)
+    fov_vertical    = 25.0   # 垂直视场角 (degrees，禾赛128线)
+
+  噪声参数:
+    sigma_xy        = 0.02   # 水平面内噪声标准差 (m)
+    sigma_z         = 0.02   # 高度方向噪声标准差 (m)
+
+  遮挡检测:
+    occlusion_threshold = math.radians(2.0)  # 两锥筒角度差小于此值时视为可能遮挡
+
+四、地面点生成
+──────────────────────────────────────────────────────────────────────────────
+
+4.1 为什么要生成地面点？
+─────────────────────────
+
+  lidar_detection 的 TraditionalDetector 管线包含 RANSAC 地面分割:
+    removeGround() → RANSAC 平面拟合 → 提取非地面点
+
+  如果点云中没有地面点，RANSAC 找不到平面，可能错误地把锥筒
+  表面的点误判为地面而过滤掉。
+
+  解决方案:
+    在每帧点云中加入 200-500 个模拟地面点，
+    分布在 LiDAR 下方 z ≈ -1.0 ~ -0.8m 附近，
+    保证 RANSAC 有足够的点拟合地面平面。
+
+4.2 生成方式
+─────────────
+
+  ground_points = []
+  for i in range(random.randint(200, 500)):
+      # 在 LiDAR 前下方随机撒点
+      r = random.uniform(1.5, max_range)          # 径向距离
+      theta = random.uniform(-fov_horiz/2, fov_horiz/2)  # 水平角
+      px = r * cos(theta)
+      py = r * sin(theta)
+      pz = -lidar_z_height + random.gauss(0, 0.05)  # 地面高度 + 噪声
+
+      # 过滤掉恰好落在锥筒上的地面点（防止误检）
+      if not near_any_cone(px, py, pz, threshold=0.3):
+          ground_points.append((px, py, pz))
+
+4.3 地面点设计要点
+───────────────────
+
+  - 地面点应随机分布在 LiDAR 前方的扇形区域内
+  - z 值应接近 LiDAR 安装高度的负值（即传感器正下方地面）
+  - 添加少量噪声 (σ=0.05m) 模拟不平整地面
+  - 不应与锥筒表面点重合（否则干扰聚类）
+
+五、伪代码实现
+──────────────────────────────────────────────────────────────────────────────
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs.point_cloud2 as pc2
+import numpy as np
+import random
+import math
+
+
+class LidarSimulator(Node):
+
+    def __init__(self):
+        super().__init__('lidar_simulator')
+
+        # ──── 参数 ────
+        self.declare_parameter('lidar_x_offset', 1.0)
+        self.declare_parameter('lidar_z_height', 1.2)
+        self.declare_parameter('min_range', 1.5)
+        self.declare_parameter('max_range', 50.0)
+        self.declare_parameter('fov_horiz_deg', 120.0)
+        self.declare_parameter('publish_rate_hz', 10.0)
+
+        self.lidar_x = self.get_parameter('lidar_x_offset').value
+        self.lidar_z = self.get_parameter('lidar_z_height').value
+        self.min_range = self.get_parameter('min_range').value
+        self.max_range = self.get_parameter('max_range').value
+        self.fov_horiz = math.radians(
+            self.get_parameter('fov_horiz_deg').value)
+
+        # ──── 锥筒列表 (由 track_loader 设置) ────
+        self.cones = []  # [(x, y, z, color), ...]
+
+        # ──── 发布者 ────
+        self.cloud_pub = self.create_publisher(
+            PointCloud2, '/hesai/pandar', 10)
+
+        # ──── 定时器 ────
+        dt = 1.0 / self.get_parameter('publish_rate_hz').value
+        self.timer = self.create_timer(dt, self.publish_scan)
+
+        self.get_logger().info('LidarSimulator ready.')
+
+    def set_cones(self, cones):
+        """设置锥筒列表 (由 track_loader 调用)"""
+        self.cones = cones
+
+    def set_ego_pose(self, x, y, yaw):
+        """更新当前车辆位姿 (由 vehicle_model 调用或通过共享状态)"""
+        self.ego_x = x
+        self.ego_y = y
+        self.ego_yaw = yaw
+
+    def transform_cone_to_sensor(self, cone_x, cone_y, cone_z):
+        """将锥筒从 map 坐标系变换到 LiDAR 传感器坐标系"""
+        dx = cone_x - (self.ego_x + self.lidar_x * math.cos(self.ego_yaw))
+        dy = cone_y - (self.ego_y + self.lidar_x * math.sin(self.ego_yaw))
+
+        d_local_x =  dx * math.cos(self.ego_yaw) + dy * math.sin(self.ego_yaw)
+        d_local_y = -dx * math.sin(self.ego_yaw) + dy * math.cos(self.ego_yaw)
+        d_local_z = cone_z - self.lidar_z
+
+        return d_local_x, d_local_y, d_local_z
+
+    def is_visible(self, sx, sy, sz):
+        """检查锥筒是否在 LiDAR 视场内"""
+        dist = math.sqrt(sx*sx + sy*sy + sz*sz)
+        if dist < self.min_range or dist > self.max_range:
+            return False
+
+        azimuth = math.atan2(sy, sx)
+        if abs(azimuth) > self.fov_horiz / 2.0:
+            return False
+
+        return True
+
+    def check_occlusion(self, visible_cones_sorted):
+        """检测遮挡，返回未被遮挡的锥筒列表"""
+        unoccluded = []
+        for i, (sx, sy, sz, cone) in enumerate(visible_cones_sorted):
+            azimuth_i = math.atan2(sy, sx)
+            dist_i = math.sqrt(sx*sx + sy*sy)
+            occluded = False
+            for j in range(i):  # 只检查更近的锥筒
+                sx_j, sy_j, _, _ = visible_cones_sorted[j]
+                azimuth_j = math.atan2(sy_j, sx_j)
+                if abs(azimuth_i - azimuth_j) < math.radians(2.0):
+                    occluded = True
+                    break
+            if not occluded:
+                unoccluded.append((sx, sy, sz, cone))
+        return unoccluded
+
+    def generate_cone_points(self, sx, sy, sz):
+        """为单个锥筒生成 12-16 个表面反射点"""
+        n = random.randint(12, 16)
+        points = []
+        for _ in range(n):
+            px = sx + random.gauss(0, 0.02)
+            py = sy + random.gauss(0, 0.02)
+            pz = sz + random.gauss(0, 0.02) + random.uniform(-0.1, 0.4)
+            points.append((px, py, pz))
+        return points
+
+    def generate_ground_points(self, n=300):
+        """生成地面点"""
+        points = []
+        for _ in range(n):
+            r = random.uniform(self.min_range, self.max_range)
+            theta = random.uniform(-self.fov_horiz/2, self.fov_horiz/2)
+            px = r * math.cos(theta)
+            py = r * math.sin(theta)
+            pz = -self.lidar_z + random.gauss(0, 0.05)
+            points.append((px, py, pz))
+        return points
+
+    def publish_scan(self):
+        """组装并发布一帧点云"""
+        all_points = []
+
+        # ── 1. 锥筒表面点 ──
+        visible = []
+        for cx, cy, cz, _ in self.cones:
+            sx, sy, sz = self.transform_cone_to_sensor(cx, cy, cz)
+            if self.is_visible(sx, sy, sz):
+                dist = math.sqrt(sx*sx + sy*sy)
+                visible.append((sx, sy, sz, (cx, cy, cz)))
+
+        # 按距离排序，处理遮挡
+        visible.sort(key=lambda v: math.sqrt(v[0]**2 + v[1]**2))
+        unoccluded = self.check_occlusion(visible)
+
+        for sx, sy, sz, _ in unoccluded:
+            all_points.extend(self.generate_cone_points(sx, sy, sz))
+
+        # ── 2. 地面点 ──
+        n_ground = random.randint(200, 500)
+        all_points.extend(self.generate_ground_points(n_ground))
+
+        # ── 3. 组装 PointCloud2 消息 ──
+        if not all_points:
+            return
+
+        header = self.get_clock().now().to_msg()
+        header.frame_id = 'hesai'
+
+        cloud_msg = pc2.create_cloud_xyz32(header, all_points)
+        self.cloud_pub.publish(cloud_msg)
+
+六、关键实现细节
+──────────────────────────────────────────────────────────────────────────────
+
+6.1 遮挡检测的必要性
+────────────────────
+
+  如果两个锥筒在 LiDAR 视角中方向几乎相同，更远的锥筒应该被
+  近处锥筒遮挡，不应被检测到。
+
+  不实现遮挡检测的后果:
+    - lidar_detection 会看到"穿透"锥筒后的点
+    - cone_map_builder 会在同一方向上积累多余锥筒
+    - 对仿真精度影响有限（因为 clustering 仍然能分离），但不够真实
+
+6.2 点云格式
+─────────────
+
+  使用 sensor_msgs.point_cloud2 模块:
+    pc2.create_cloud_xyz32(header, points)
+
+  或者手动构造:
+    fields = [
+        PointField(name='x',  offset=0,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='y',  offset=4,  datatype=PointField.FLOAT32, count=1),
+        PointField(name='z',  offset=8,  datatype=PointField.FLOAT32, count=1),
+    ]
+
+6.3 帧ID的重要性
+────────────────
+
+  frame_id = 'hesai' 必须与 KISS-ICP 配置中的输入 frame 一致，
+  否则 TF 树无法建立，KISS-ICP 会报错。
+
+  在 kiss_icp_hesai128.yaml 中确认:
+    # 通常 KISS-ICP 期望点云在 LiDAR 坐标系下
+    # 如果配置了 base_frame: "base_link"，则需要 TF: hesai→base_link
+
+6.4 性能优化
+─────────────
+
+  - 10Hz 频率 + 几百个点，Python 完全够用
+  - 如果锥筒数量很大 (>500)，可以在 map 坐标系中做粗筛选:
+      只检查车辆前方 50m 范围内的锥筒
+  - 使用 numpy 数组而非 Python list 加速坐标变换
+
+七、LiDAR 模拟器调参指南
+──────────────────────────────────────────────────────────────────────────────
+
+  问题: lidar_detection 检测不到锥筒
+  ─────────────────────────────────
+  可能原因:
+    1. 表面点数不够 → 增加 num_points (12-16 → 20-30)
+    2. 噪声太大 → 减小 sigma_xy
+    3. 地面点干扰 → 减少地面点数或增大 RANSAC 阈值
+    4. 锥筒被遮挡 → 检查遮挡检测逻辑
+
+  问题: lidar_detection 误检过多
+  ──────────────────────────────
+  可能原因:
+    1. 地面点离群 → 增加地面点 z 偏移 (让它们更接近真实地面)
+    2. 噪声太大 → 减小 sigma
+
+  问题: KISS-ICP 不收敛
+  ──────────────────────
+  可能原因:
+    1. 点云太稀疏 → 增加地面点数 (200-500 → 500-1000)
+    2. 锥筒表面点数太少 → 增加每个锥筒的点数
+    3. voxel_size 太大 → 减小 kiss_icp_hesai128.yaml 中的 voxel_size
+
+================================================================================
+  下一步: 请阅读 05_INS_CAN模拟器实现.txt
+================================================================================

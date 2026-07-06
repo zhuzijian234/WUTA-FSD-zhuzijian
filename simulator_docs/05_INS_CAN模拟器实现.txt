@@ -1,0 +1,383 @@
+================================================================================
+  WUTA-FSD 模拟器 — INS 模拟器 + CAN 模拟器
+================================================================================
+
+第一部分：INS 模拟器 (ins_simulator.py)
+──────────────────────────────────────────────────────────────────────────────
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+  模拟华测 CG-410 组合导航系统的输出。
+
+  真车上 CG-410 做什么:
+    - 内部融合 GNSS RTK + IMU（加速度计+陀螺仪）
+    - 输出绝对位置（厘米级）+ 姿态 + 速度
+    - 通过串口/网口发布 nav_msgs/Odometry 到 /cg410/odometry
+
+  仿真器中 ins_simulator 做什么:
+    - 读取 vehicle_model 的真实位姿
+    - 添加零均值高斯噪声模拟 GNSS 和 IMU 的测量误差
+    - 发布 /cg410/odometry (Odometry, 20Hz)
+
+二、噪声模型
+──────────────────────────────────────────────────────────────────────────────
+
+  2.1 噪声参数
+  ─────────────
+
+    位置噪声:  σ_pos    = 0.05m   (GNSS RTK 典型精度 2-5cm)
+    航向噪声:  σ_yaw    = 0.5°    (IMU 融合后航向精度)
+    速度噪声:  σ_vel    = 0.1m/s (GNSS 多普勒测速精度)
+    角速度噪声:σ_angular= 0.02rad/s (陀螺仪噪声)
+
+  2.2 噪声生成
+  ─────────────
+
+    import random  # 或 numpy.random
+
+    noisy_x = gt_x + random.gauss(0, sigma_pos)
+    noisy_y = gt_y + random.gauss(0, sigma_pos)
+    noisy_z = gt_z + random.gauss(0, sigma_pos * 0.5)  # 高程精度通常更差
+    noisy_yaw = gt_yaw + random.gauss(0, math.radians(sigma_yaw_deg))
+
+  2.3 协方差矩阵
+  ───────────────
+
+    Odometry 消息中需要填充协方差矩阵，告知 EKF 各测量值的可信度:
+
+    pose_covariance = [
+        sigma_pos², 0,          0,          0, 0, 0,
+        0,          sigma_pos², 0,          0, 0, 0,
+        0,          0,          0.001,       0, 0, 0,  # z 轴向
+        0,          0,          0,          0.001, 0, 0,  # roll
+        0,          0,          0,          0, 0.001, 0,  # pitch
+        0,          0,          0,          0, 0, sigma_yaw_rad²,  # yaw
+    ]
+
+    twist_covariance = [
+        sigma_vel²,  0,          0,          0, 0, 0,
+        0,          sigma_vel², 0,          0, 0, 0,
+        0,          0,          0.001,       0, 0, 0,
+        0,          0,          0,          0.001, 0, 0,
+        0,          0,          0,          0, 0.001, 0,
+        0,          0,          0,          0, 0, sigma_angular²,
+    ]
+
+    协方差越大 → EKF 越不信任该测量 → 更多依赖 KISS-ICP
+
+三、伪代码实现
+──────────────────────────────────────────────────────────────────────────────
+
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Quaternion
+import math
+import random
+
+
+class InsSimulator(Node):
+
+    def __init__(self):
+        super().__init__('ins_simulator')
+
+        # ──── 参数 ────
+        self.declare_parameter('publish_rate_hz', 20.0)
+        self.declare_parameter('sigma_pos', 0.05)         # m
+        self.declare_parameter('sigma_yaw_deg', 0.5)       # degrees
+        self.declare_parameter('sigma_vel', 0.1)           # m/s
+        self.declare_parameter('sigma_angular', 0.02)      # rad/s
+
+        self.sigma_pos = self.get_parameter('sigma_pos').value
+        self.sigma_yaw = math.radians(
+            self.get_parameter('sigma_yaw_deg').value)
+        self.sigma_vel = self.get_parameter('sigma_vel').value
+        self.sigma_angular = self.get_parameter('sigma_angular').value
+
+        # ──── 当前状态（从 vehicle_model 获取）────
+        self.ego_x = 0.0
+        self.ego_y = 0.0
+        self.ego_yaw = 0.0
+        self.ego_speed = 0.0
+
+        # ──── 发布者 ────
+        self.odom_pub = self.create_publisher(
+            Odometry, '/cg410/odometry', 10)
+
+        # ──── 定时器 ────
+        dt = 1.0 / self.get_parameter('publish_rate_hz').value
+        self.timer = self.create_timer(dt, self.publish_odometry)
+
+        self.get_logger().info('InsSimulator ready.')
+
+    def set_ego_state(self, x, y, yaw, speed):
+        """更新当前车辆状态 (由 vehicle_model 调用)"""
+        self.ego_x = x
+        self.ego_y = y
+        self.ego_yaw = yaw
+        self.ego_speed = speed
+
+    def yaw_to_quaternion(self, yaw):
+        """航向角 → 四元数"""
+        q = Quaternion()
+        q.z = math.sin(yaw * 0.5)
+        q.w = math.cos(yaw * 0.5)
+        # x, y 保持 0（绕Z轴旋转）
+        return q
+
+    def publish_odometry(self):
+        """发布带噪声的 Odometry"""
+
+        # ── 添加零均值高斯噪声 ──
+        noisy_x = self.ego_x + random.gauss(0, self.sigma_pos)
+        noisy_y = self.ego_y + random.gauss(0, self.sigma_pos)
+        noisy_yaw = self.ego_yaw + random.gauss(0, self.sigma_yaw)
+        noisy_speed = self.ego_speed + random.gauss(0, self.sigma_vel)
+
+        # ── 构造消息 ──
+        msg = Odometry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'odom'
+        msg.child_frame_id = 'base_link'
+
+        msg.pose.pose.position.x = noisy_x
+        msg.pose.pose.position.y = noisy_y
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation = self.yaw_to_quaternion(noisy_yaw)
+
+        msg.twist.twist.linear.x = noisy_speed
+        msg.twist.twist.linear.y = 0.0
+        msg.twist.twist.linear.z = 0.0
+        msg.twist.twist.angular.z = (
+            self.ego_speed * math.tan(0.0) / 1.53  # 近似
+            + random.gauss(0, self.sigma_angular)
+        )
+
+        # ── 填充协方差矩阵 ──
+        # (略，参考上面 2.3 节的矩阵值)
+
+        self.odom_pub.publish(msg)
+
+四、关键设计决策
+──────────────────────────────────────────────────────────────────────────────
+
+4.1 为什么要有噪声？
+────────────────────
+
+  EKF 节点 (ekf_node) 的设计目的是融合多个有噪声的传感器。
+  如果 /cg410/odometry 是完美无噪声的（真值），EKF 会完全
+  信任它而忽略 KISS-ICP 的里程计。
+
+  添加噪声后:
+    - EKF 需要在两个传感器间权衡
+    - 能测试 EKF 的滤波参数是否合理
+    - 更接近真实场景
+
+4.2 噪声种子
+─────────────
+
+  建议使用固定随机种子（在 simulator.yaml 中配置），
+  确保每次运行结果可复现:
+
+    seed: 42  # 0 = 随机
+
+  if seed != 0:
+      random.seed(seed)
+
+4.3 发布频率 20Hz
+──────────────────
+
+  CG-410 在实际使用中通常以 20Hz 输出。
+  这与 KISS-ICP 的 10Hz 不在同一频率上，
+  EKF 需要处理异步传感器 — 这正是 robot_localization 的标准用法。
+
+──────────────────────────────────────────────────────────────────────────────
+
+第二部分：CAN 模拟器 (can_simulator.py)
+──────────────────────────────────────────────────────────────────────────────
+
+一、模块职责
+──────────────────────────────────────────────────────────────────────────────
+
+  模拟 CAN 总线上的车速信号。
+
+  真车上的数据流:
+    轮速传感器 → VCU → CAN 总线 → can_msgs/Frame → CAN驱动
+    → 解析为 geometry_msgs/TwistStamped → /localization/velocity
+
+  仿真器中:
+    直接读取 vehicle_model 的 GT speed
+    → 发布 /localization/velocity (TwistStamped, 50Hz)
+
+  消费者:
+    controller_node.onVelocity()
+    → 提取 speed = sqrt(vx² + vy²)
+    → vehicle_state_.velocity = speed
+    → PurePursuit.compute() 中用速度计算前视距离:
+        lookahead = clamp(|v| * ld_ratio, min_lookahead, max_lookahead)
+
+二、为什么 controller 需要单独订阅速度？
+──────────────────────────────────────────────────────────────────────────────
+
+  Pure Pursuit 的前视距离是速度自适应的:
+    lookahead = speed * ld_ratio  (clamp between 2.0 ~ 20.0m)
+
+  速度来源有两个途径:
+    1. /localization/pose → 相邻两帧差分 → 速度
+       ✗ 差分引入噪声，低速时不可靠
+    2. /localization/velocity → 直接读取轮速传感器
+       ✓ 来自物理传感器，更精确
+
+  真车上采用途径2，仿真器也模拟途径2。
+
+  此外，TwistFilter 需要区分加速/减速:
+    加速: out = 0.9*last + 0.1*raw  (慢响应)
+    减速: out = 0.3*last + 0.7*raw  (快响应)
+  这也依赖于可靠的速度测量。
+
+三、伪代码实现
+──────────────────────────────────────────────────────────────────────────────
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import TwistStamped
+import random
+
+
+class CanSimulator(Node):
+
+    def __init__(self):
+        super().__init__('can_simulator')
+
+        # ──── 参数 ────
+        self.declare_parameter('publish_rate_hz', 50.0)
+
+        # ──── 当前速度（从 vehicle_model 获取）────
+        self.ego_speed = 0.0
+
+        # ──── 发布者 ────
+        self.twist_pub = self.create_publisher(
+            TwistStamped, '/localization/velocity', 10)
+
+        # ──── 定时器 ────
+        dt = 1.0 / self.get_parameter('publish_rate_hz').value
+        self.timer = self.create_timer(dt, self.publish_velocity)
+
+        self.get_logger().info('CanSimulator ready.')
+
+    def set_ego_speed(self, speed):
+        """更新当前速度 (由 vehicle_model 调用)"""
+        self.ego_speed = speed
+
+    def publish_velocity(self):
+        """发布模拟车速"""
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'base_link'
+
+        # 直接使用 GT speed，不加噪声
+        # (轮速传感器精度很高，噪声可忽略)
+        msg.twist.linear.x = self.ego_speed
+        msg.twist.linear.y = 0.0
+        msg.twist.linear.z = 0.0ota
+        msg.twist.angular.x = 0.0
+        msg.twist.angular.y = 0.0
+        msg.twist.angular.z = 0.0
+
+        self.twist_pub.publish(msg)
+
+四、模块间状态共享方案
+──────────────────────────────────────────────────────────────────────────────
+
+INS 模拟器和 CAN 模拟器都需要从 vehicle_model 获取当前状态。
+有以下几种方案:
+
+方案A: 全局共享变量（推荐用于仿真器）
+─────────────────────────────────────
+
+  # 在 __init__.py 或单独的 state.py 中:
+  class SimState:
+      x = 0.0
+      y = 0.0
+      yaw = 0.0
+      speed = 0.0
+      steer = 0.0
+
+  # vehicle_model.update() 中:
+  SimState.x = self.x
+  SimState.y = self.y
+  ...
+
+  # ins_simulator.publish_odometry() 中:
+  noisy_x = SimState.x + random.gauss(0, sigma)
+
+  优点: 零延迟，最简单
+  缺点: 非 ROS 风格，但仿真器内部可接受
+
+方案B: ROS2 参数
+─────────────────
+
+  vehicle_model 每次更新后 set_parameter()
+  ins_simulator / can_simulator 每次读取 get_parameter()
+
+  优点: ROS 风格
+  缺点: 参数更新有延迟，不适合 50Hz
+
+方案C: ROS2 话题
+─────────────────
+
+  vehicle_model 发布 /sim/internal_state (自定义消息)
+  ins_simulator / can_simulator 订阅
+
+  优点: 完全解耦，ROS 标准
+  缺点: 多一层通信开销，但 50Hz 完全可接受
+
+  推荐方案A（简单高效），方案C（更规范，方便后续扩展）
+
+五、参数配置示例 (simulator.yaml)
+──────────────────────────────────────────────────────────────────────────────
+
+simulator:
+  ros__parameters:
+    # 通用参数
+    track_file: "tracks/trackdrive.yaml"
+    seed: 42                      # 随机种子，0=随机
+
+    # 车辆模型
+    wheelbase: 1.53               # m
+    max_steer_deg: 25.0           # degrees
+    update_rate_hz: 50.0
+
+    # LiDAR 模拟器
+    lidar_x_offset: 1.0           # m
+    lidar_y_offset: 0.0           # m
+    lidar_z_height: 1.2           # m
+    lidar_min_range: 1.5          # m
+    lidar_max_range: 50.0         # m
+    lidar_fov_horiz_deg: 120.0    # degrees
+    lidar_fov_vert_deg: 25.0      # degrees
+    lidar_cone_points_min: 12     # 每个锥筒最少点数
+    lidar_cone_points_max: 16     # 每个锥筒最多点数
+    lidar_ground_points_min: 200  # 最少地面点数
+    lidar_ground_points_max: 500  # 最多地面点数
+    lidar_sigma_xy: 0.02          # m
+    lidar_sigma_z: 0.02           # m
+    lidar_publish_rate_hz: 10.0
+
+    # INS 模拟器
+    ins_sigma_pos: 0.05           # m
+    ins_sigma_yaw_deg: 0.5        # degrees
+    ins_sigma_vel: 0.1            # m/s
+    ins_sigma_angular: 0.02       # rad/s
+    ins_publish_rate_hz: 20.0
+
+    # CAN 模拟器
+    can_publish_rate_hz: 50.0
+
+    # 模式
+    mode: "A"                     # "A" = 跳过定位, "B" = 全仿真
+
+================================================================================
+  下一步: 请阅读 06_赛道加载器实现.txt
+================================================================================
