@@ -321,7 +321,7 @@ def distance_judge(
     dist = np.linalg.norm(cone_position[:2] - car_position[:2]) #计算向量的长度,即锥桶与车辆的距离
     return bool(min_dist <= dist <= max_dist)
 
-#4.锥桶是否被遮挡?
+#4.锥桶是否被遮挡?(这里简化算法,忽略雷达120°的视角范围,只要锥桶在车辆前方,就认为锥桶可能被遮挡)
 def _parse_obstacle_box(obstacle: Any) -> Tuple[np.ndarray, np.ndarray]:
     """Normalize a cone obstacle to an axis-aligned bounding box."""
     if isinstance(obstacle, dict) and "bbox_min" in obstacle and "bbox_max" in obstacle: #如果写了obstacle直接读取
@@ -332,7 +332,7 @@ def _parse_obstacle_box(obstacle: Any) -> Tuple[np.ndarray, np.ndarray]:
     cone = normalize_cone(obstacle)
     half_xy = cone.size[:2] / 2.0
     bbox_min = np.array(
-        [cone.position[0] - half_xy[0], cone.position[1] - half_xy[1], cone.position[2]],
+        [cone.position[0] - half_xy[0], cone.position[1] - half_xy[1], cone.position[2]],#底部贴地,z=0
         dtype=float,
     )
     bbox_max = np.array(
@@ -341,7 +341,7 @@ def _parse_obstacle_box(obstacle: Any) -> Tuple[np.ndarray, np.ndarray]:
     )
     return bbox_min, bbox_max
 
-
+#射线与AABB相交检测
 def _segment_intersects_aabb(
     start: Any,
     end: Any,
@@ -350,19 +350,28 @@ def _segment_intersects_aabb(
     eps: float = 1e-9,
 ) -> bool:
     """Slab test for an open line segment intersecting an AABB."""
-    start = _as_vector3(start, "start")
-    end = _as_vector3(end, "end")
+    start = _as_vector3(start, "start") #雷达/车辆位置
+    end = _as_vector3(end, "end")       #目标锥桶位置
     bbox_min = _as_vector3(bbox_min, "bbox_min")
     bbox_max = _as_vector3(bbox_max, "bbox_max")
     direction = end - start
-    t_min = 0.0
-    t_max = 1.0
+    t_min = 0.0  #最早进入时间
+    t_max = 1.0  #最晚离开时间
 
     for axis in range(3):
-        if abs(direction[axis]) <= eps:
+        if abs(direction[axis]) <= eps: #射线接近平行于这个面
             if start[axis] < bbox_min[axis] or start[axis] > bbox_max[axis]:
-                return False
-            continue
+                return False #不相交
+            continue #起点在这个范围内,这个轴跳过
+#start+t*direction=bbox_min/bbox_max,求出t的范围,如果t_min>t_max说明没有交点
+#X轴:  ──────●══════════●──────  t进入=0.2, t离开=0.8
+#Y轴:  ─────────●══════●───────  t进入=0.3, t离开=0.7
+#Z轴:  ───●══════════════●─────  t进入=0.1, t离开=0.9
+
+#            ↑取max        ↑取min
+#         实际进入=0.3   实际离开=0.7
+
+#0.3 < 0.7 → 有重叠 → 射线穿过了盒子！
 
         inv_dir = 1.0 / direction[axis]
         t1 = (bbox_min[axis] - start[axis]) * inv_dir
@@ -374,9 +383,9 @@ def _segment_intersects_aabb(
         if t_min > t_max:
             return False
 
-    return bool(t_max > eps and t_min < 1.0 - eps)
+    return bool(t_max > eps and t_min < 1.0 - eps)#排除锥桶在后面或者在t=1时相交的情况
 
-
+#会不会被其他锥桶挡住?
 def occlusion_judge(
     car_position: Any,
     cone_position: Any,
@@ -390,12 +399,12 @@ def occlusion_judge(
     True when any cone box intersects the open segment from car_position to
     cone_position.
     """
-    if not obstacles:
+    if not obstacles: #没有障碍物,返回false
         return False
 
     car_position = _as_vector3(car_position, "car_position")
     cone_position = _as_vector3(cone_position, "cone_position")
-    if np.dot(cone_position - car_position, cone_position - car_position) <= eps:
+    if np.dot(cone_position - car_position, cone_position - car_position) <= eps: #向量长度约为0.几乎重叠,不判遮挡
         return False
 
     for obstacle in obstacles:
@@ -403,7 +412,7 @@ def occlusion_judge(
         if np.allclose(obstacle_record.position, cone_position, atol=eps):
             continue
         bbox_min, bbox_max = _parse_obstacle_box(obstacle_record)
-        if _segment_intersects_aabb(car_position, cone_position, bbox_min, bbox_max, eps):
+        if _segment_intersects_aabb(car_position, cone_position, bbox_min, bbox_max, eps): #射线穿过这个盒子,被遮挡!
             return True
 
     return False
@@ -429,7 +438,7 @@ def judge(
         return False
     return True
 
-
+#点云生成函数
 def generate_cone_surface_points(
     cone_position: Any,
     cone_type: Optional[str] = None,
