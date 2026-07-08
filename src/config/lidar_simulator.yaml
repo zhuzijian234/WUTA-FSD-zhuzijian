@@ -1,0 +1,28 @@
+lidar_simulator:
+  ros__parameters:
+    track_file: ""
+    ground_truth_topic: "/sim/ground_truth"
+    pointcloud_topic: "/hesai/pandar"
+    visible_markers_topic: "/sim/lidar/visible_cones"
+    publish_rate_hz: 10.0
+    frame_id: "lidar"
+    use_start_pose_until_odom: true
+    random_seed: 42
+
+    fov_deg: 120.0
+    min_range: 1.5
+    max_range: 50.0
+    points_per_cone_min: 12
+    points_per_cone_max: 16
+    surface_noise_std: 0.02
+    center_noise_std: 0.02
+    ground_points_min: 200
+    ground_points_max: 500
+    ground_z_std: 0.05
+    lidar_height: 1.0
+    lidar_offset_x: 0.0
+    lidar_offset_y: 0.0
+    lidar_offset_z: 1.0
+    detection_probability: 1.0
+    include_ground: true
+    enable_occlusion: true
