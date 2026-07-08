@@ -14,7 +14,7 @@ COLOR_YELLOW = 2
 COLOR_ORANGE = 3
 COLOR_RED = 4
 
-
+#每类锥桶的标准尺寸
 @dataclass(frozen=True)
 class ConeSpec:
     name: str
@@ -23,7 +23,7 @@ class ConeSpec:
     size: Tuple[float, float, float]  # width, depth, height in meters
     aliases: Tuple[str, ...]
 
-
+#每类锥桶的字典
 CONE_SPECS: Dict[str, ConeSpec] = {
     "large_orange": ConeSpec(
         name="large_orange",
@@ -57,44 +57,44 @@ CONE_SPECS: Dict[str, ConeSpec] = {
 
 DEFAULT_CONE_TYPE = "small_blue"
 
-
+#雷达参数
 @dataclass(frozen=True)
 class LidarConfig:
-    fov_deg: float = 120.0
-    min_range: float = 1.5
-    max_range: float = 50.0
-    points_per_cone_min: int = 12
-    points_per_cone_max: int = 16
-    surface_noise_std: float = 0.02
-    center_noise_std: float = 0.02
-    ground_points_min: int = 200
-    ground_points_max: int = 500
-    ground_z_std: float = 0.05
-    lidar_height: float = 1.0
-    lidar_offset: Tuple[float, float, float] = (0.0, 0.0, 1.0)
-    detection_probability: float = 1.0
-    include_ground: bool = True
-    enable_occlusion: bool = True
+    fov_deg: float = 120.0                                         #水平视角场
+    min_range: float = 1.5                                         #最近检测距离 
+    max_range: float = 50.0                                        #最远检测距离
+    points_per_cone_min: int = 12                                  #每个锥桶最少点数
+    points_per_cone_max: int = 16                                  #每个锥桶最多点数
+    surface_noise_std: float = 0.02                                #表面噪声标准差
+    center_noise_std: float = 0.02                                 #中心噪声标准差
+    ground_points_min: int = 200                                   #地面点数最小值
+    ground_points_max: int = 500                                   #地面点数最大值
+    ground_z_std: float = 0.05                                     #地面Z轴标准差
+    lidar_height: float = 1.0                                      #激光雷达高度
+    lidar_offset: Tuple[float, float, float] = (0.0, 0.0, 1.0)    #激光雷达偏移
+    detection_probability: float = 1.0                             #检测概率
+    include_ground: bool = True                                    #是否包含地面点
+    enable_occlusion: bool = True                                  #是否启用遮挡检测
 
-
+#每个锥桶的记录
 @dataclass
 class ConeRecord:
-    position: np.ndarray
-    color: str
-    color_id: int
-    cone_type: str
-    size: np.ndarray
-    confidence: float = 1.0
+    position: np.ndarray                                   #锥桶位置
+    color: str                                             #锥桶颜色
+    color_id: int                                          #锥桶颜色ID
+    cone_type: str                                         #锥桶类型
+    size: np.ndarray                                       #锥桶尺寸
+    confidence: float = 1.0                                #置信度
 
-
-def _as_vector3(value: Any, name: str = "vector") -> np.ndarray:
-    arr = np.asarray(value, dtype=float).reshape(-1)
-    if arr.shape[0] < 3:
+#向量处理函数/Value:Any,类型注解,接受任意类型/name:str,类型注解,默认值为"vector"/返回值类型注解为np.ndarray
+def _as_vector3(value: Any, name: str = "vector") -> np.ndarray: #私有函数
+    arr = np.asarray(value, dtype=float).reshape(-1) #-1表示自动计算,数组变为一维
+    if arr.shape[0] < 3:      #输入不足三个值就报错
         raise ValueError(f"{name} must contain at least 3 values.")
-    return arr[:3].copy()
+    return arr[:3].copy() #复制一份新数组返回
 
-
-def _yaw_rotation(yaw: float) -> np.ndarray:
+#绕z轴旋转的坐标变换,车辆不需要俯仰角转换
+def _yaw_rotation(yaw: float) -> np.ndarray: #私有函数
     c = float(np.cos(yaw))
     s = float(np.sin(yaw))
     return np.array(
@@ -106,57 +106,57 @@ def _yaw_rotation(yaw: float) -> np.ndarray:
         dtype=float,
     )
 
-
+#位姿解析器
 def parse_pose(pose: Any) -> Tuple[np.ndarray, float]:
     """Return base position [x, y, z] and yaw from dict or array-like pose."""
-    if isinstance(pose, dict):
+    if isinstance(pose, dict): #检查pose是否为字典类型
         if "position" in pose:
             position = _as_vector3(pose["position"], "pose position")
         else:
             position = np.array(
                 [
-                    float(pose.get("x", 0.0)),
+                    float(pose.get("x", 0.0)), #取字典pose的值,没有默认为0.0    
                     float(pose.get("y", 0.0)),
                     float(pose.get("z", 0.0)),
                 ],
                 dtype=float,
             )
-        yaw = float(pose.get("yaw", pose.get("heading", 0.0)))
-        return position, yaw
+        yaw = float(pose.get("yaw", pose.get("heading", 0.0))) #先找yaw,没有就找heading,没有就默认为0.0
+        return position, yaw  
 
-    values = np.asarray(pose, dtype=float).reshape(-1)
-    if values.shape[0] == 3:
+    values = np.asarray(pose, dtype=float).reshape(-1) #pose不是字典,压缩为一维数组
+    if values.shape[0] == 3: #[x, y, yaw]格式 把z轴默认为0.0 返回x, y, z=0.0,yaw
         return np.array([values[0], values[1], 0.0], dtype=float), float(values[2])
-    if values.shape[0] >= 4:
+    if values.shape[0] >= 4: #  [x, y, z, yaw]格式 
         return values[:3].copy(), float(values[3])
     raise ValueError("Pose must be [x, y, yaw], [x, y, z, yaw], or a dict.")
 
-
+#别名查找
 def _cone_spec_from_kind(kind: Optional[Any]) -> ConeSpec:
     if kind is None:
         return CONE_SPECS[DEFAULT_CONE_TYPE]
 
-    normalized = str(kind).strip().lower()
-    for spec in CONE_SPECS.values():
+    normalized = str(kind).strip().lower() #kind转为小写字符串,去掉首尾空格
+    for spec in CONE_SPECS.values(): #CONE_SPECS.values()返回字典中所有的值,即所有的ConeSpec对象
         if normalized == spec.name or normalized in spec.aliases:
-            return spec
-    raise ValueError(f"Unknown cone type/color: {kind!r}")
+            return spec #符合就返回conespec对象
+    raise ValueError(f"Unknown cone type/color: {kind!r}") #找不到报错
 
-
+#优先级查找 #optional参数,可以为None,返回值为ConeSpec对象
 def _spec_from_color_and_type(color: Optional[Any], cone_type: Optional[Any]) -> ConeSpec:
     if cone_type is not None:
-        return _cone_spec_from_kind(cone_type)
-    if color is not None:
+        return _cone_spec_from_kind(cone_type) #调用模糊查找函数找到具体的CONESPECS对象
+    if color is not None: #先类别再颜色
         return _cone_spec_from_kind(color)
     return _cone_spec_from_kind(DEFAULT_CONE_TYPE)
 
-
+#锥桶规范器
 def normalize_cone(cone: Any, default_type: str = DEFAULT_CONE_TYPE) -> ConeRecord:
     """Normalize dict/array cone data to a ConeRecord."""
-    if isinstance(cone, ConeRecord):
+    if isinstance(cone, ConeRecord): #如果cone已经是ConeRecord对象,直接返回
         return cone
 
-    if isinstance(cone, dict):
+    if isinstance(cone, dict):             #没有position就返回默认值cone.get("center") 
         raw_position = cone.get("position", cone.get("center"))
         if raw_position is None and {"x", "y"}.issubset(cone.keys()):
             raw_position = [cone["x"], cone["y"], cone.get("z", 0.0)]
@@ -169,7 +169,7 @@ def normalize_cone(cone: Any, default_type: str = DEFAULT_CONE_TYPE) -> ConeReco
         if "size" in cone or "dimensions" in cone:
             size = _as_vector3(cone.get("size", cone.get("dimensions")), "cone size")
         else:
-            size = np.asarray(spec.size, dtype=float)
+            size = np.asarray(spec.size, dtype=float) #没有就用spec的标准尺寸
 
         return ConeRecord(
             position=_as_vector3(raw_position, "cone position"),
@@ -194,7 +194,7 @@ def normalize_cone(cone: Any, default_type: str = DEFAULT_CONE_TYPE) -> ConeReco
         size=size,
     )
 
-
+#赛道加载器,返回两个列表.一个是锥桶字典列表,一个是起始位姿[x,y,z,yaw]
 def load_track_yaml(track_file: Any) -> Tuple[list, list]:
     """
     Load a simulator track YAML directly into cone dictionaries and start pose.
@@ -208,9 +208,9 @@ def load_track_yaml(track_file: Any) -> Tuple[list, list]:
         raise FileNotFoundError(f"Track file not found: {path}")
 
     with path.open("r", encoding="utf-8") as stream:
-        data = yaml.safe_load(stream) or {}
+        data = yaml.safe_load(stream) or {}  #解析yaml文件,返回dict/list等
 
-    track = data.get("track", data)
+    track = data.get("track", data) #支持两种格式的yaml文件,有track键的就取track键的值,没有就取整个data
     start_pose_data = track.get("start_pose", {})
     start_pose = [
         float(start_pose_data.get("x", 0.0)),
@@ -221,45 +221,45 @@ def load_track_yaml(track_file: Any) -> Tuple[list, list]:
 
     cones = []
     cone_groups = (
-        ("blue_cones", "blue", "small_blue"),
+        ("blue_cones", "blue", "small_blue"), #key, color, cone_type
         ("yellow_cones", "yellow", "small_yellow"),
         ("orange_cones", "orange", "large_orange"),
         ("red_cones", "red", "small_red"),
         ("unknown_cones", "unknown", DEFAULT_CONE_TYPE),
     )
     for key, color, cone_type in cone_groups:
-        for entry in track.get(key, []) or []:
-            if isinstance(entry, dict):
+        for entry in track.get(key, []) or []: #防止取null值
+            if isinstance(entry, dict): #entry是字典的情况
                 position = [
                     float(entry.get("x", 0.0)),
                     float(entry.get("y", 0.0)),
                     float(entry.get("z", 0.0)),
                 ]
-            else:
+            else: #entry是列表/数组的情况
                 values = np.asarray(entry, dtype=float).reshape(-1)
                 if values.shape[0] < 2:
                     raise ValueError(f"Invalid cone entry in {path}: {entry!r}")
                 position = [
                     float(values[0]),
                     float(values[1]),
-                    float(values[2]) if values.shape[0] > 2 else 0.0,
+                    float(values[2]) if values.shape[0] > 2 else 0.0, #长度大于2取z,==2取0
                 ]
 
             cones.append({"position": position, "color": color, "type": cone_type})
-
+#取为统一格式
     return cones, start_pose
-
-
+#坐标变换三连
+#雷达在世界坐标系的位置
 def lidar_origin_from_pose(
     vehicle_pose: Any,
-    lidar_offset: Iterable[float] = (0.0, 0.0, 1.0),
+    lidar_offset: Iterable[float] = (0.0, 0.0, 1.0), #默认雷达再高为1m的地方
 ) -> Tuple[np.ndarray, float]:
     base_position, yaw = parse_pose(vehicle_pose)
     offset = _as_vector3(lidar_offset, "lidar_offset")
-    lidar_origin = base_position + _yaw_rotation(yaw) @ offset
+    lidar_origin = base_position + _yaw_rotation(yaw) @ offset #旋转矩阵*偏移量,再加上车辆位置,得到雷达在世界坐标系的位置
     return lidar_origin, yaw
 
-
+#世界坐标->雷达坐标
 def world_to_lidar(
     point_world: Any,
     vehicle_pose: Any,
@@ -268,9 +268,9 @@ def world_to_lidar(
     """Transform a map/world point into the LiDAR frame."""
     point_world = _as_vector3(point_world, "point_world")
     lidar_origin, yaw = lidar_origin_from_pose(vehicle_pose, lidar_offset)
-    return _yaw_rotation(-yaw) @ (point_world - lidar_origin)
-
-
+    return _yaw_rotation(-yaw) @ (point_world - lidar_origin) 
+#后者是世界坐标系下的点减去雷达在世界坐标系下的位置,得到相对雷达的向量,再乘以旋转矩阵,得到雷达坐标系下的点
+#雷达坐标->世界坐标
 def lidar_to_world(
     point_lidar: Any,
     vehicle_pose: Any,
@@ -279,18 +279,18 @@ def lidar_to_world(
     """Transform a LiDAR-frame point into the map/world frame."""
     point_lidar = _as_vector3(point_lidar, "point_lidar")
     lidar_origin, yaw = lidar_origin_from_pose(vehicle_pose, lidar_offset)
-    return lidar_origin + _yaw_rotation(yaw) @ point_lidar
-
-
+    return lidar_origin + _yaw_rotation(yaw) @ point_lidar #同理,逆变换
+#模拟雷达的可见性
+#1.锥桶在车辆前方吗?
 def front(car_position: Any, car_heading: float, cone_position: Any) -> bool:
     """Return True when the cone is in front of the vehicle/LiDAR."""
     car_position = _as_vector3(car_position, "car_position")
     cone_position = _as_vector3(cone_position, "cone_position")
-    delta = cone_position[:2] - car_position[:2]
-    x_forward = delta[0] * np.cos(car_heading) + delta[1] * np.sin(car_heading)
+    delta = cone_position[:2] - car_position[:2] #从车指向锥桶的向量
+    x_forward = delta[0] * np.cos(car_heading) + delta[1] * np.sin(car_heading) #车头朝向与向量的点积
     return bool(x_forward > 0.0)
 
-
+#2.锥桶在水平视角范围内吗?(雷达只有120°的水平视角,所以要判断锥桶是否在这个范围内)
 def angle_judge(
     car_position: Any,
     car_heading: float,
@@ -302,13 +302,13 @@ def angle_judge(
     cone_position = _as_vector3(cone_position, "cone_position")
     dx = cone_position[0] - car_position[0]
     dy = cone_position[1] - car_position[1]
-    angle_to_cone = np.arctan2(dy, dx)
-    relative_angle = angle_to_cone - car_heading
-    relative_angle = (relative_angle + np.pi) % (2 * np.pi) - np.pi
+    angle_to_cone = np.arctan2(dy, dx) #计算车头指向锥桶的角度,与世界坐标系x轴正向的夹角
+    relative_angle = angle_to_cone - car_heading #计算锥桶相对于车头的角度
+    relative_angle = (relative_angle + np.pi) % (2 * np.pi) - np.pi #将角度归一化到[-pi, pi]范围内
     half_fov = np.radians(fov_deg / 2.0)
-    return bool(abs(relative_angle) <= half_fov)
+    return bool(abs(relative_angle) <= half_fov) #偏角绝对是是否小于等于视角范围的1/2
 
-
+#3.锥桶在距离范围内吗? 
 def distance_judge(
     car_position: Any,
     cone_position: Any,
@@ -318,17 +318,17 @@ def distance_judge(
     """Return True when the cone is inside the valid horizontal LiDAR range."""
     car_position = _as_vector3(car_position, "car_position")
     cone_position = _as_vector3(cone_position, "cone_position")
-    dist = np.linalg.norm(cone_position[:2] - car_position[:2])
+    dist = np.linalg.norm(cone_position[:2] - car_position[:2]) #计算向量的长度,即锥桶与车辆的距离
     return bool(min_dist <= dist <= max_dist)
 
-
+#4.锥桶是否被遮挡?
 def _parse_obstacle_box(obstacle: Any) -> Tuple[np.ndarray, np.ndarray]:
     """Normalize a cone obstacle to an axis-aligned bounding box."""
-    if isinstance(obstacle, dict) and "bbox_min" in obstacle and "bbox_max" in obstacle:
+    if isinstance(obstacle, dict) and "bbox_min" in obstacle and "bbox_max" in obstacle: #如果写了obstacle直接读取
         bbox_min = _as_vector3(obstacle["bbox_min"], "bbox_min")
         bbox_max = _as_vector3(obstacle["bbox_max"], "bbox_max")
         return np.minimum(bbox_min, bbox_max), np.maximum(bbox_min, bbox_max)
-
+#自动推算
     cone = normalize_cone(obstacle)
     half_xy = cone.size[:2] / 2.0
     bbox_min = np.array(
