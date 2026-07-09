@@ -71,7 +71,7 @@ class LidarConfig:
     ground_points_max: int = 500                                   #地面点数最大值
     ground_z_std: float = 0.05                                     #地面Z轴标准差
     lidar_height: float = 1.0                                      #激光雷达高度
-    lidar_offset: Tuple[float, float, float] = (0.0, 0.0, 1.0)    #激光雷达偏移
+    lidar_offset: Tuple[float, float, float] = (0.0, 0.0, 1.0)     #激光雷达偏移
     detection_probability: float = 1.0                             #检测概率
     include_ground: bool = True                                    #是否包含地面点
     enable_occlusion: bool = True                                  #是否启用遮挡检测
