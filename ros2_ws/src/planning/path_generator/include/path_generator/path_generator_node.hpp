@@ -3,9 +3,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <autoware_msgs/msg/lane.hpp>
-
-#include <string>
-#include <vector>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "wuta_msgs/msg/mission_state.hpp"
 
@@ -18,7 +16,7 @@ namespace path_generator
  * Subscribes to MissionState and routes to the correct path generation mode:
  *
  *  TRACKDRIVE  → forwards centerline from boundary_detector (Delaunay)
- *  SKIDPAD     → publishes a fixed four-lap figure-8 and exit path
+ *  SKIDPAD     → generates figure-8 path (predefined geometry)
  *  ACCELERATION → generates straight-line path to finish
  *
  * All modes output to /planning/final_waypoints (autoware_msgs::Lane),
@@ -39,42 +37,34 @@ private:
   autoware_msgs::msg::Lane generateSkidpadPath() const;
   autoware_msgs::msg::Lane generateAccelerationPath() const;
 
-  struct SkidpadCsvRow
-  {
-    std::string phase;
-    int lap{0};
-    double x{0.0};
-    double y{0.0};
-    double yaw{0.0};
-    double velocity{0.0};
-  };
-  void exportSkidpadCsv(const std::vector<SkidpadCsvRow> & rows) const;
+  // Visualization helpers
+  void publishVisualization(const autoware_msgs::msg::Lane & lane,
+                            float r, float g, float b);
+  void publishTrajectory();
 
   // State
   uint8_t mission_mode_{wuta_msgs::msg::MissionState::MISSION_TRACKDRIVE};
   uint8_t system_state_{wuta_msgs::msg::MissionState::IDLE};
   geometry_msgs::msg::PoseStamped current_pose_;
   bool pose_ready_{false};
-  autoware_msgs::msg::Lane skidpad_path_;
-  bool skidpad_path_ready_{false};
+
+  // Cached path for SKIDPAD / ACCELERATION — generated once from initial pose
+  // then re-published unmodified on every onMissionState trigger.
+  autoware_msgs::msg::Lane cached_lane_;
+  bool path_generated_{false};
+
+  // Trajectory history — accumulates driven positions for visualization
+  std::vector<geometry_msgs::msg::Point> trajectory_;
+  geometry_msgs::msg::Point last_trajectory_point_;
 
   // Parameters
   // Trackdrive
   double trackdrive_velocity_{7.0};    // m/s
 
-  // Skidpad reference in map.  This matches tracks/skidpad.yaml by default.
+  // Skidpad (FSG standard: two circles, r=9.125m, center offset=±9.125m from start)
   double skidpad_radius_{9.125};       // m
   double skidpad_velocity_{5.0};       // m/s
   int    skidpad_points_{72};          // waypoints per circle (every 5 deg)
-  double skidpad_start_x_{0.0};        // m, crossing reference
-  double skidpad_start_y_{0.0};        // m, crossing reference
-  double skidpad_start_yaw_{0.0};      // rad, entry/exit direction
-  double skidpad_entry_x_{-15.0};      // m, local to crossing reference
-  double skidpad_entry_y_{0.0};        // m, local to crossing reference
-  double skidpad_exit_length_{25.0};   // m, measured from the crossing
-  double skidpad_braking_distance_{10.0};  // m
-  // Relative paths are rooted at the detected WUTA-FSD directory.
-  std::string skidpad_csv_path_{"ros2_ws/log/trajectory/skidpad_trajectory.csv"};
 
   // Acceleration (75m straight)
   double acceleration_length_{75.0};   // m
@@ -85,8 +75,10 @@ private:
   rclcpp::Subscription<autoware_msgs::msg::Lane>::SharedPtr centerline_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
 
-  // Publisher
+  // Publishers
   rclcpp::Publisher<autoware_msgs::msg::Lane>::SharedPtr waypoints_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr trajectory_viz_pub_;
 };
 
 }  // namespace path_generator

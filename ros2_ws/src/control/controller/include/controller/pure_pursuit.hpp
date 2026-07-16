@@ -36,7 +36,6 @@ public:
     double ld_ratio{2.0};         // lookahead = velocity × ratio
     double min_lookahead{2.0};    // m — clamp at low speed
     double max_lookahead{20.0};   // m — clamp at high speed
-    int max_progress_advance{4};  // waypoints per control update
   };
 
   explicit PurePursuit(const VehicleParams & params, const Config & cfg);
@@ -47,23 +46,16 @@ public:
    * @param waypoints  Reference path (autoware_msgs Lane waypoints)
    */
   ControlCommand compute(const VehicleState & state,
-                         const std::vector<autoware_msgs::msg::Waypoint> & waypoints,
-                         double lookahead_override = 0.0);
+                         const std::vector<autoware_msgs::msg::Waypoint> & waypoints);
 
   // Accessors for diagnostics
   double lookaheadDistance() const { return lookahead_dist_; }
   int    targetIndex()       const { return target_idx_; }
-  int    progressIndex()     const { return progress_idx_; }
-  void   reset();
 
 private:
   int findTargetIndex(const VehicleState & state,
                       const std::vector<autoware_msgs::msg::Waypoint> & waypoints,
-                      double ld) const;
-
-  int findNearestForwardIndex(
-    const VehicleState & state,
-    const std::vector<autoware_msgs::msg::Waypoint> & waypoints) const;
+                      double ld);
 
   // Transform global point to vehicle body frame, return lateral offset x
   static double lateralOffset(double target_x, double target_y,
@@ -76,7 +68,6 @@ private:
 
   double lookahead_dist_{0.0};
   int    target_idx_{0};
-  int    progress_idx_{0};
 };
 
 }  // namespace controller

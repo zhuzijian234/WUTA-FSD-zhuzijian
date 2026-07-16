@@ -3,7 +3,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <autoware_msgs/msg/lane.hpp>
 #include <autoware_msgs/msg/command.hpp>
@@ -27,18 +26,12 @@ private:
   void onWaypoints(const autoware_msgs::msg::Lane::SharedPtr msg);
   void onMissionState(const wuta_msgs::msg::MissionState::SharedPtr msg);
   void controlLoop();
-  bool isSamePath(const std::vector<autoware_msgs::msg::Waypoint> & candidate) const;
-  void publishMissionComplete();
 
   void publishVisualization(double target_x, double target_y);
 
   // Algorithm objects
   std::unique_ptr<PurePursuit>  pure_pursuit_;
   std::unique_ptr<TwistFilter>  twist_filter_;
-
-  // A figure-eight has tangent-continuous but curvature-discontinuous joins at
-  // the timing-line crossing.  It needs a shorter preview than open tracks.
-  double skidpad_lookahead_{3.0};
 
   // State
   VehicleState vehicle_state_;
@@ -47,9 +40,6 @@ private:
   bool waypoints_ready_{false};
   bool enabled_{false};  // Only run when mission is EXPLORE or RACE
   uint8_t mission_mode_{wuta_msgs::msg::MissionState::MISSION_TRACKDRIVE};
-  bool mission_complete_{false};
-  double finish_position_tolerance_{0.75};
-  double finish_speed_threshold_{0.2};
 
   // Subscribers
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
@@ -59,7 +49,6 @@ private:
 
   // Publishers
   rclcpp::Publisher<autoware_msgs::msg::Command>::SharedPtr cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_complete_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr target_viz_pub_;
 
   // Control loop timer

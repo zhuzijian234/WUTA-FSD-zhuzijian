@@ -1,10 +1,5 @@
 #include "path_generator/path_generator_node.hpp"
-#include <ament_index_cpp/get_package_share_directory.hpp>
-#include <algorithm>
 #include <cmath>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
 
 namespace path_generator
 {
@@ -18,15 +13,6 @@ PathGeneratorNode::PathGeneratorNode(const rclcpp::NodeOptions & options)
   skidpad_radius_         = declare_parameter("skidpad_radius",         skidpad_radius_);
   skidpad_velocity_       = declare_parameter("skidpad_velocity",       skidpad_velocity_);
   skidpad_points_         = declare_parameter("skidpad_points",         skidpad_points_);
-  skidpad_start_x_        = declare_parameter("skidpad_start_x",        skidpad_start_x_);
-  skidpad_start_y_        = declare_parameter("skidpad_start_y",        skidpad_start_y_);
-  skidpad_start_yaw_      = declare_parameter("skidpad_start_yaw",      skidpad_start_yaw_);
-  skidpad_entry_x_        = declare_parameter("skidpad_entry_x",        skidpad_entry_x_);
-  skidpad_entry_y_        = declare_parameter("skidpad_entry_y",        skidpad_entry_y_);
-  skidpad_exit_length_    = declare_parameter("skidpad_exit_length",    skidpad_exit_length_);
-  skidpad_braking_distance_ = declare_parameter(
-    "skidpad_braking_distance", skidpad_braking_distance_);
-  skidpad_csv_path_       = declare_parameter("skidpad_csv_path",       skidpad_csv_path_);
   acceleration_length_    = declare_parameter("acceleration_length",    acceleration_length_);
   acceleration_velocity_  = declare_parameter("acceleration_velocity",  acceleration_velocity_);
 
@@ -46,6 +32,14 @@ PathGeneratorNode::PathGeneratorNode(const rclcpp::NodeOptions & options)
   // Publisher — final_waypoints consumed by controller
   waypoints_pub_ = create_publisher<autoware_msgs::msg::Lane>("/planning/final_waypoints", 10);
 
+  // Visualization — LINE_STRIP through planned waypoints
+  viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+    "/planning/final_waypoints_viz", 10);
+
+  // Visualization — driven trajectory growing behind the vehicle
+  trajectory_viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+    "/planning/driven_trajectory_viz", 10);
+
   RCLCPP_INFO(get_logger(), "PathGeneratorNode ready.");
 }
 
@@ -53,31 +47,67 @@ void PathGeneratorNode::onPose(const geometry_msgs::msg::PoseStamped::SharedPtr 
 {
   current_pose_ = *msg;
   pose_ready_ = true;
+
+  // Accumulate driven trajectory (skip if position unchanged to avoid duplicates)
+  geometry_msgs::msg::Point pt;
+  pt.x = msg->pose.position.x;
+  pt.y = msg->pose.position.y;
+  pt.z = msg->pose.position.z;
+
+  if (trajectory_.empty() ||
+      std::abs(pt.x - last_trajectory_point_.x) > 0.01 ||
+      std::abs(pt.y - last_trajectory_point_.y) > 0.01)
+  {
+    trajectory_.push_back(pt);
+    last_trajectory_point_ = pt;
+
+    // Publish trajectory every few points — always publish so RViz can discover
+    // the topic even before subscribing (ADD with same ns/id replaces in place)
+    if (trajectory_.size() % 3 == 0)
+    {
+      publishTrajectory();
+    }
+  }
 }
 
 void PathGeneratorNode::onMissionState(const State::SharedPtr msg)
 {
+  // Detect mode change → invalidate cached path so the new mode regenerates
+  const bool mode_changed = (msg->mission_mode != mission_mode_);
+  if (mode_changed) {
+    path_generated_ = false;
+    RCLCPP_INFO(get_logger(), "Mode changed -> invalidated cached path");
+  }
+
   mission_mode_  = msg->mission_mode;
   system_state_  = msg->state;
 
   // Trigger non-trackdrive paths when system is active
   if (system_state_ != State::EXPLORE && system_state_ != State::RACE) return;
+  if (!pose_ready_) return;
 
   if (mission_mode_ == State::MISSION_SKIDPAD) {
-    if (!skidpad_path_ready_) {
-      skidpad_path_ = generateSkidpadPath();
-      skidpad_path_ready_ = true;
+    if (!path_generated_) {
+      cached_lane_ = generateSkidpadPath();
+      path_generated_ = true;
+      RCLCPP_INFO(get_logger(), "Skidpad path cached (%zu waypoints)", cached_lane_.waypoints.size());
     }
-    auto lane = skidpad_path_;
+    auto lane = cached_lane_;
     lane.header.stamp    = now();
     lane.header.frame_id = "map";
     waypoints_pub_->publish(lane);
+    publishVisualization(lane, 0.0f, 1.0f, 1.0f);  // cyan for skidpad
   } else if (mission_mode_ == State::MISSION_ACCELERATION) {
-    if (!pose_ready_) return;
-    auto lane = generateAccelerationPath();
+    if (!path_generated_) {
+      cached_lane_ = generateAccelerationPath();
+      path_generated_ = true;
+      RCLCPP_INFO(get_logger(), "Acceleration path cached (%zu waypoints)", cached_lane_.waypoints.size());
+    }
+    auto lane = cached_lane_;
     lane.header.stamp    = now();
     lane.header.frame_id = "map";
     waypoints_pub_->publish(lane);
+    publishVisualization(lane, 1.0f, 0.5f, 0.0f);  // orange for acceleration
   }
   // TRACKDRIVE: forwarded by onCenterline callback
 }
@@ -94,138 +124,59 @@ void PathGeneratorNode::onCenterline(const autoware_msgs::msg::Lane::SharedPtr m
     wp.twist.twist.linear.x = trackdrive_velocity_;
   }
   waypoints_pub_->publish(lane);
-}
-
-void PathGeneratorNode::exportSkidpadCsv(const std::vector<SkidpadCsvRow> & rows) const
-{
-  if (skidpad_csv_path_.empty()) return;
-
-  namespace fs = std::filesystem;
-  fs::path output_path(skidpad_csv_path_);
-  if (output_path.is_relative()) {
-    try {
-      // <WUTA-FSD>/ros2_ws/install/path_generator/share/path_generator
-      // is the package share path in this workspace installation.
-      fs::path fsd_root = ament_index_cpp::get_package_share_directory("path_generator");
-      for (int i = 0; i < 5; ++i) fsd_root = fsd_root.parent_path();
-      output_path = fsd_root / output_path;
-    } catch (const std::exception & exception) {
-      RCLCPP_WARN(get_logger(), "Cannot resolve WUTA-FSD output root: %s", exception.what());
-    }
-  }
-
-  std::error_code error;
-  fs::create_directories(output_path.parent_path(), error);
-  if (error) {
-    RCLCPP_ERROR(get_logger(), "Unable to create skidpad CSV directory %s: %s",
-      output_path.parent_path().c_str(), error.message().c_str());
-    return;
-  }
-
-  std::ofstream stream(output_path);
-  if (!stream.is_open()) {
-    RCLCPP_ERROR(get_logger(), "Unable to write skidpad CSV: %s", output_path.c_str());
-    return;
-  }
-
-  stream << "index,phase,lap,x_m,y_m,yaw_rad,target_speed_mps\n";
-  stream << std::fixed << std::setprecision(6);
-  for (std::size_t index = 0; index < rows.size(); ++index) {
-    const auto & row = rows[index];
-    stream << index << ',' << row.phase << ',' << row.lap << ','
-           << row.x << ',' << row.y << ',' << row.yaw << ',' << row.velocity << '\n';
-  }
-  RCLCPP_INFO(get_logger(), "Skidpad trajectory CSV: %s (%zu rows)",
-    output_path.c_str(), rows.size());
+  publishVisualization(lane, 0.0f, 1.0f, 0.0f);  // green for trackdrive
 }
 
 autoware_msgs::msg::Lane PathGeneratorNode::generateSkidpadPath() const
 {
   autoware_msgs::msg::Lane lane;
-  std::vector<SkidpadCsvRow> csv_rows;
 
-  // The track is fixed in map, not regenerated from the moving vehicle pose.
-  // At yaw=0 the crossing is (0, 0), the right circle is below it and the
-  // left circle above it, matching perception_simulation/tracks/skidpad.yaml.
-  const double c = std::cos(skidpad_start_yaw_);
-  const double s = std::sin(skidpad_start_yaw_);
-  const auto to_map = [this, c, s](double local_x, double local_y, double local_yaw,
-                                    autoware_msgs::msg::Waypoint & wp) {
-    wp.pose.pose.position.x = skidpad_start_x_ + local_x * c - local_y * s;
-    wp.pose.pose.position.y = skidpad_start_y_ + local_x * s + local_y * c;
-    wp.pose.pose.position.z = 0.0;
-    const double yaw = skidpad_start_yaw_ + local_yaw;
-    wp.pose.pose.orientation.z = std::sin(yaw * 0.5);
-    wp.pose.pose.orientation.w = std::cos(yaw * 0.5);
-  };
+  // FSG Skidpad: two circles of radius 9.125m
+  // Right circle first (standard FSG direction), then left circle
+  // Start at vehicle position
+  const double cx = current_pose_.pose.position.x;
+  const double cy = current_pose_.pose.position.y;
+  const double z  = current_pose_.pose.position.z;
 
-  const auto append_waypoint = [&lane, &csv_rows, &to_map, this](
-    double local_x, double local_y, double local_yaw, double velocity,
-    const std::string & phase, int lap) {
-      autoware_msgs::msg::Waypoint wp;
-      to_map(local_x, local_y, local_yaw, wp);
-      wp.twist.twist.linear.x = velocity;
-      lane.waypoints.push_back(wp);
-      csv_rows.push_back({phase, lap, wp.pose.pose.position.x, wp.pose.pose.position.y,
-        skidpad_start_yaw_ + local_yaw, velocity});
-    };
+  // Vehicle heading
+  const auto & q = current_pose_.pose.orientation;
+  const double yaw = std::atan2(
+    2.0 * (q.w * q.z + q.x * q.y),
+    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 
-  const int circle_points = std::max(8, skidpad_points_);
-  const double d_theta = 2.0 * M_PI / circle_points;
+  // Circle centers: perpendicular to heading, offset by radius
+  const double right_cx = cx + skidpad_radius_ * std::sin(yaw);
+  const double right_cy = cy - skidpad_radius_ * std::cos(yaw);
+  const double left_cx  = cx - skidpad_radius_ * std::sin(yaw);
+  const double left_cy  = cy + skidpad_radius_ * std::cos(yaw);
 
-  // FSAC: the vehicle starts 15 m before the timing line and enters in the
-  // same direction as the eventual exit.  Include the straight explicitly so
-  // the controller never shortcuts from the staging point to a circle.
-  const double entry_length = std::hypot(skidpad_entry_x_, skidpad_entry_y_);
-  const int entry_segments = std::max(1, static_cast<int>(std::ceil(entry_length)));
-  for (int i = 0; i <= entry_segments; ++i) {
-    const double ratio = static_cast<double>(i) / entry_segments;
-    append_waypoint(skidpad_entry_x_ * (1.0 - ratio),
-      skidpad_entry_y_ * (1.0 - ratio), skidpad_entry_y_ == 0.0 ? 0.0 :
-      std::atan2(-skidpad_entry_y_, -skidpad_entry_x_), skidpad_velocity_, "entry", 0);
+  const double d_theta = 2.0 * M_PI / skidpad_points_;
+
+  // Two laps right circle, two laps left circle (FSG rules)
+  // Right circle: CW from vehicle tangent point (θ=π/2), theta decreases
+  for (int i = 0; i <= 2 * skidpad_points_; ++i) {
+    const double theta = M_PI_2 - i * d_theta;
+    autoware_msgs::msg::Waypoint wp;
+    wp.pose.pose.position.x = right_cx + skidpad_radius_ * std::cos(theta);
+    wp.pose.pose.position.y = right_cy + skidpad_radius_ * std::sin(theta);
+    wp.pose.pose.position.z = z;
+    wp.pose.pose.orientation.w = 1.0;
+    wp.twist.twist.linear.x = skidpad_velocity_;
+    lane.waypoints.push_back(wp);
+  }
+  // Left circle: CCW from vehicle tangent point (θ=-π/2), theta increases
+  for (int i = 0; i <= 2 * skidpad_points_; ++i) {
+    const double theta = -M_PI_2 + i * d_theta;
+    autoware_msgs::msg::Waypoint wp;
+    wp.pose.pose.position.x = left_cx + skidpad_radius_ * std::cos(theta);
+    wp.pose.pose.position.y = left_cy + skidpad_radius_ * std::sin(theta);
+    wp.pose.pose.position.z = z;
+    wp.pose.pose.orientation.w = 1.0;
+    wp.twist.twist.linear.x = skidpad_velocity_;
+    lane.waypoints.push_back(wp);
   }
 
-  // The first right lap establishes steering, the second is timed.  Start at
-  // i=1 because the entry already contributes the crossing waypoint; each
-  // subsequent phase similarly reuses only the preceding phase's endpoint.
-  for (int lap = 0; lap < 2; ++lap) {
-    for (int i = 1; i <= circle_points; ++i) {
-      const double theta = M_PI_2 - i * d_theta;  // clockwise, starts at crossing
-      append_waypoint(skidpad_radius_ * std::cos(theta),
-        -skidpad_radius_ + skidpad_radius_ * std::sin(theta),
-        std::atan2(-std::cos(theta), std::sin(theta)), skidpad_velocity_,
-        "right_circle", lap + 1);
-    }
-  }
-
-  // Third lap enters the left circle; the fourth is timed.  Counter-clockwise
-  // travel preserves the +x crossing direction.
-  for (int lap = 0; lap < 2; ++lap) {
-    for (int i = 1; i <= circle_points; ++i) {
-      const double theta = -M_PI_2 + i * d_theta;  // counter-clockwise
-      append_waypoint(skidpad_radius_ * std::cos(theta),
-        skidpad_radius_ + skidpad_radius_ * std::sin(theta),
-        std::atan2(std::cos(theta), -std::sin(theta)), skidpad_velocity_,
-        "left_circle", lap + 3);
-    }
-  }
-
-  // Leave the crossing in the same direction as entry and stop at 25 m.
-  // The final braking segment gives the controller a decreasing speed target.
-  for (int i = 1; i <= static_cast<int>(std::ceil(skidpad_exit_length_)); ++i) {
-    const double distance = std::min(static_cast<double>(i), skidpad_exit_length_);
-    const double remaining = skidpad_exit_length_ - distance;
-    const double velocity = remaining < skidpad_braking_distance_
-      ? skidpad_velocity_ * remaining / skidpad_braking_distance_
-      : skidpad_velocity_;
-    append_waypoint(distance, 0.0, 0.0, velocity, "exit", 0);
-  }
-
-  exportSkidpadCsv(csv_rows);
-
-  RCLCPP_INFO(get_logger(),
-    "Fixed skidpad path generated: %.1f m entry, right lap 1/2, left lap 3/4, %.1f m exit (%zu waypoints)",
-    entry_length, skidpad_exit_length_, lane.waypoints.size());
+  RCLCPP_INFO(get_logger(), "SKIDPAD V2 pts=%d -> %zu waypoints", skidpad_points_, lane.waypoints.size());
   return lane;
 }
 
@@ -264,6 +215,61 @@ autoware_msgs::msg::Lane PathGeneratorNode::generateAccelerationPath() const
 
   RCLCPP_INFO(get_logger(), "Acceleration path generated: %zu waypoints", lane.waypoints.size());
   return lane;
+}
+
+void PathGeneratorNode::publishVisualization(
+  const autoware_msgs::msg::Lane & lane,
+  float r, float g, float b)
+{
+  visualization_msgs::msg::MarkerArray arr;
+
+  // LINE_STRIP through all waypoints — ADD with same ns/id replaces in place
+  visualization_msgs::msg::Marker line;
+  line.header = lane.header;
+  line.ns     = "planned_path";
+  line.id     = 0;
+  line.type   = visualization_msgs::msg::Marker::LINE_STRIP;
+  line.action = visualization_msgs::msg::Marker::ADD;
+  line.scale.x = 0.08;  // line width
+  line.color.r = r;
+  line.color.g = g;
+  line.color.b = b;
+  line.color.a = 0.9f;
+
+  for (const auto & wp : lane.waypoints) {
+    geometry_msgs::msg::Point p;
+    p.x = wp.pose.pose.position.x;
+    p.y = wp.pose.pose.position.y;
+    p.z = wp.pose.pose.position.z;
+    line.points.push_back(p);
+  }
+  arr.markers.push_back(line);
+  viz_pub_->publish(arr);
+}
+
+void PathGeneratorNode::publishTrajectory()
+{
+  if (trajectory_.size() < 2) return;
+
+  visualization_msgs::msg::MarkerArray arr;
+
+  // LINE_STRIP of driven positions — ADD with same ns/id replaces previous marker
+  visualization_msgs::msg::Marker line;
+  line.header.frame_id = "map";
+  line.header.stamp    = now();
+  line.ns     = "driven_trajectory";
+  line.id     = 0;
+  line.type   = visualization_msgs::msg::Marker::LINE_STRIP;
+  line.action = visualization_msgs::msg::Marker::ADD;
+  line.scale.x = 0.06;  // slightly thinner than planned path
+  line.color.r = 1.0f;
+  line.color.g = 0.85f;
+  line.color.b = 0.0f;
+  line.color.a = 0.9f;
+  line.points = trajectory_;
+
+  arr.markers.push_back(line);
+  trajectory_viz_pub_->publish(arr);
 }
 
 }  // namespace path_generator

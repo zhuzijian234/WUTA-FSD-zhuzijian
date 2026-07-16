@@ -1,5 +1,5 @@
 #include "controller/controller_node.hpp"
-#include <cmath>
+#include <chrono>
 #include <visualization_msgs/msg/marker.hpp>
 
 namespace controller
@@ -21,19 +21,12 @@ ControllerNode::ControllerNode(const rclcpp::NodeOptions & options)
   pp_cfg.ld_ratio       = declare_parameter("ld_ratio",       pp_cfg.ld_ratio);
   pp_cfg.min_lookahead  = declare_parameter("min_lookahead",  pp_cfg.min_lookahead);
   pp_cfg.max_lookahead  = declare_parameter("max_lookahead",  pp_cfg.max_lookahead);
-  pp_cfg.max_progress_advance = declare_parameter(
-    "max_progress_advance", pp_cfg.max_progress_advance);
-  skidpad_lookahead_ = declare_parameter("skidpad_lookahead", skidpad_lookahead_);
 
   pure_pursuit_ = std::make_unique<PurePursuit>(vp, pp_cfg);
   twist_filter_ = std::make_unique<TwistFilter>(vp);
 
   // --- Control loop rate ---
   const int rate_hz = declare_parameter("control_rate_hz", 50);
-  finish_position_tolerance_ = declare_parameter(
-    "finish_position_tolerance", finish_position_tolerance_);
-  finish_speed_threshold_ = declare_parameter(
-    "finish_speed_threshold", finish_speed_threshold_);
 
   // --- Subscribers ---
   pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -54,8 +47,6 @@ ControllerNode::ControllerNode(const rclcpp::NodeOptions & options)
 
   // --- Publishers ---
   cmd_pub_ = create_publisher<autoware_msgs::msg::Command>("/control/command", 10);
-  mission_complete_pub_ = create_publisher<std_msgs::msg::Bool>(
-    "/system/mission_complete", 10);
   target_viz_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
     "/control/target_viz", 10);
 
@@ -64,7 +55,7 @@ ControllerNode::ControllerNode(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(1000 / rate_hz),
     std::bind(&ControllerNode::controlLoop, this));
 
-  RCLCPP_INFO(get_logger(), "ControllerNode ready. rate=%dHz, LD_ratio=%.1f",
+  RCLCPP_INFO(get_logger(), "ControllerNode V2 ready. rate=%dHz, LD_ratio=%.1f",
     rate_hz, pp_cfg.ld_ratio);
 }
 
@@ -91,13 +82,8 @@ void ControllerNode::onVelocity(const geometry_msgs::msg::TwistStamped::SharedPt
 
 void ControllerNode::onWaypoints(const autoware_msgs::msg::Lane::SharedPtr msg)
 {
-  const bool changed = !isSamePath(msg->waypoints);
   waypoints_ = msg->waypoints;
   waypoints_ready_ = !waypoints_.empty();
-  if (changed) {
-    pure_pursuit_->reset();
-    mission_complete_ = false;
-  }
 }
 
 void ControllerNode::onMissionState(const MissionState::SharedPtr msg)
@@ -120,33 +106,30 @@ void ControllerNode::controlLoop()
 {
   if (!enabled_ || !pose_ready_ || !waypoints_ready_) return;
 
-  if (mission_complete_) return;
-
   // 1. Pure Pursuit
-  // At 5 m/s the generic LD=v*2 would preview 10 m, almost one skidpad
-  // radius.  At the entry, circle transition, and exit this selects a point
-  // from the following path segment and makes the bicycle model cut inward or
-  // unload steering before the crossing.  Keep that behaviour for other
-  // missions, but use the calibrated local preview for skidpad.
-  const double lookahead_override =
-    mission_mode_ == MissionState::MISSION_SKIDPAD ? skidpad_lookahead_ : 0.0;
-  auto raw_cmd = pure_pursuit_->compute(
-    vehicle_state_, waypoints_, lookahead_override);
-
-  if (mission_mode_ == MissionState::MISSION_SKIDPAD &&
-      pure_pursuit_->progressIndex() == static_cast<int>(waypoints_.size()) - 1 &&
-      std::hypot(
-        waypoints_.back().pose.pose.position.x - vehicle_state_.x,
-        waypoints_.back().pose.pose.position.y - vehicle_state_.y) <= finish_position_tolerance_ &&
-      vehicle_state_.velocity <= finish_speed_threshold_)
-  {
-    publishMissionComplete();
-    return;
-  }
-
+  auto raw_cmd = pure_pursuit_->compute(vehicle_state_, waypoints_);
   if (!raw_cmd.valid) return;
 
-  // 2. Safety filter
+  // 2. Stop when path completed — only for fixed paths (skidpad/acceleration).
+  //    Trackdrive centerline is updated continuously, so its "end" is not
+  //    the real finish line.
+  const bool is_fixed_path =
+    (mission_mode_ == MissionState::MISSION_SKIDPAD ||
+     mission_mode_ == MissionState::MISSION_ACCELERATION);
+  if (is_fixed_path) {
+    const int N = static_cast<int>(waypoints_.size());
+    if (pure_pursuit_->targetIndex() >= N - 3) {
+      const auto & last_wp = waypoints_.back();
+      const double dx = vehicle_state_.x - last_wp.pose.pose.position.x;
+      const double dy = vehicle_state_.y - last_wp.pose.pose.position.y;
+      if (std::sqrt(dx*dx + dy*dy) < 1.0) {
+        raw_cmd.velocity   = 0.0;
+        raw_cmd.steering_angle = 0.0;
+      }
+    }
+  }
+
+  // 3. Safety filter
   auto filtered = twist_filter_->filter(raw_cmd.steering_angle, raw_cmd.velocity);
 
   // 3. Publish command
@@ -155,6 +138,24 @@ void ControllerNode::controlLoop()
   cmd.angle    = filtered.steering_angle;
   cmd.dv_state = filtered.emergency ? 6 : 4;  // 4=normal, 6=emergency
   cmd_pub_->publish(cmd);
+
+  // DEBUG: throttled to 2 Hz
+  {
+    static auto last_log = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log).count() >= 500) {
+      last_log = now;
+      int tgt = pure_pursuit_->targetIndex();
+      double ld = pure_pursuit_->lookaheadDistance();
+      RCLCPP_INFO(get_logger(),
+        "state=(%.2f,%.2f) yaw=%.2f° v=%.2f | waypoints=%zu | target=%d/%zu ld=%.2f "
+        "| raw(angle=%.1f° vel=%.1f) | cmd(angle=%.1f° vel=%.1f)",
+        vehicle_state_.x, vehicle_state_.y, vehicle_state_.yaw * 180.0 / M_PI,
+        vehicle_state_.velocity, waypoints_.size(), tgt, waypoints_.size(), ld,
+        raw_cmd.steering_angle, raw_cmd.velocity,
+        filtered.steering_angle, filtered.velocity);
+    }
+  }
 
   // 4. Visualization (target waypoint marker)
   if (target_viz_pub_->get_subscription_count() > 0 &&
@@ -165,43 +166,6 @@ void ControllerNode::controlLoop()
       wp.pose.pose.position.x,
       wp.pose.pose.position.y);
   }
-}
-
-bool ControllerNode::isSamePath(
-  const std::vector<autoware_msgs::msg::Waypoint> & candidate) const
-{
-  if (candidate.size() != waypoints_.size()) return false;
-  for (size_t i = 0; i < candidate.size(); ++i) {
-    const auto & lhs = candidate[i].pose.pose.position;
-    const auto & rhs = waypoints_[i].pose.pose.position;
-    if (std::abs(lhs.x - rhs.x) > 1e-6 || std::abs(lhs.y - rhs.y) > 1e-6 ||
-        std::abs(lhs.z - rhs.z) > 1e-6) {
-      return false;
-    }
-  }
-  return true;
-}
-
-void ControllerNode::publishMissionComplete()
-{
-  mission_complete_ = true;
-  enabled_ = false;
-  twist_filter_->reset();
-
-  autoware_msgs::msg::Command stop;
-  stop.speed = 0.0;
-  stop.angle = 0.0;
-  stop.dv_state = 4;
-  cmd_pub_->publish(stop);
-
-  std_msgs::msg::Bool complete;
-  complete.data = true;
-  mission_complete_pub_->publish(complete);
-  RCLCPP_INFO(
-    get_logger(),
-    "Skidpad complete: progress=%d/%zu pose=(%.3f, %.3f) speed=%.3f m/s",
-    pure_pursuit_->progressIndex(), waypoints_.size() - 1,
-    vehicle_state_.x, vehicle_state_.y, vehicle_state_.velocity);
 }
 
 void ControllerNode::publishVisualization(double target_x, double target_y)

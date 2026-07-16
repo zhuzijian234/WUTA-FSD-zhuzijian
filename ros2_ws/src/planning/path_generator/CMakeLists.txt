@@ -9,6 +9,7 @@ find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(wuta_msgs REQUIRED)
 find_package(autoware_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 add_executable(path_generator_node src/path_generator_node.cpp)
 
@@ -22,6 +23,7 @@ ament_target_dependencies(path_generator_node
   geometry_msgs
   wuta_msgs
   autoware_msgs
+  visualization_msgs
 )
 
 install(TARGETS path_generator_node
